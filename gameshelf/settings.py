@@ -43,6 +43,10 @@ INSTALLED_APPS = [
     "apps.library",
     "apps.games",
     "apps.reviews",
+    "apps.recommendation",
+    "apps.analytics",
+    "apps.moderation",
+    
 ]
 
 MIDDLEWARE = [
