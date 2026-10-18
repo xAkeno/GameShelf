@@ -19,7 +19,6 @@ def are_friends(a, b) -> bool:
         .exists()
     )
 
-
 def can_view(owner, viewer, visibility: str) -> bool:
     """Whether `viewer` may see something `owner` marked public / friends / private."""
     if viewer is not None and viewer.is_authenticated:
