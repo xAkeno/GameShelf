@@ -56,7 +56,7 @@ def run_password_validators(password, user=None):
         raise serializers.ValidationError(list(exc.messages))
 
 
-# ─── Register / login / password ──────────────────────────────────────────────
+# ─── Register / login / password / Forget  ──────────────────────────────────────────────
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, style={"input_type": "password"})
 
@@ -132,6 +132,8 @@ class ChangePasswordSerializer(serializers.Serializer):
             )
         return attrs
 
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
 
 # ─── Profiles ─────────────────────────────────────────────────────────────────
 class UserMeSerializer(serializers.ModelSerializer):
