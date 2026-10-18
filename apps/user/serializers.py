@@ -1,3 +1,8 @@
+import os
+import uuid
+
+from django.conf import settings
+from django.core.files.storage import default_storage
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -30,6 +35,54 @@ def can_view(owner, viewer, visibility: str) -> bool:
         return are_friends(viewer, owner)
     return False
 
+avatar_file = serializers.ImageField(
+    write_only=True, required=False
+)
+banner_file = serializers.ImageField(
+    write_only=True, required=False
+)
+
+def update(self, instance, validated_data):
+    avatar = validated_data.pop("avatar_file", None)
+    banner = validated_data.pop("banner_file", None)
+
+    instance = super().update(instance, validated_data)
+
+    if avatar:
+        ext = os.path.splitext(avatar.name)[1].lower()
+        filename = f"avatars/{uuid.uuid4().hex}{ext}"
+        instance.avatar_url = default_storage.url(
+            default_storage.save(filename, avatar)
+        )
+
+    if banner:
+        ext = os.path.splitext(banner.name)[1].lower()
+        filename = f"banners/{uuid.uuid4().hex}{ext}"
+        instance.banner_url = default_storage.url(
+            default_storage.save(filename, banner)
+        )
+
+    if avatar or banner:
+        instance.save(update_fields=["avatar_url", "banner_url"])
+
+    return instance
+
+def to_representation(self, instance):
+    data = super().to_representation(instance)
+    request = self.context.get("request")
+
+    for field in ("avatar_url", "banner_url"):
+        url = data.get(field)
+
+        if (
+            request
+            and url
+            and url.startswith(settings.MEDIA_URL)
+        ):
+            data[field] = request.build_absolute_uri(url)
+
+    return data
+
 
 def count_friends(user) -> int:
     return (
@@ -61,7 +114,7 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ["username", "email", "password"]
+        fields = ["username", "email", "password", "avatar_file", "banner_file"]
         extra_kwargs = {
             "username": {"min_length": 3},
             "email": {"required": True, "allow_blank": False},
@@ -140,18 +193,57 @@ class UserMeSerializer(serializers.ModelSerializer):
 
     email_verified = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(source="date_joined", read_only=True)
+    avatar_file = serializers.ImageField(write_only=True, required=False)
+    banner_file = serializers.ImageField(write_only=True, required=False)   
 
     class Meta:
         model = User
         fields = [
             "id", "username", "email", "email_verified", "role",
             "nickname", "bio", "avatar_url", "banner_url",
-            "library_visibility", "friends_visibility", "created_at",
+            "library_visibility", "friends_visibility", "created_at","avatar_file",
+            "banner_file",
         ]
         read_only_fields = ["id", "username", "email", "role"]
 
     def get_email_verified(self, obj) -> bool:
         return obj.email_verified_at is not None
+
+    def update(self, instance, validated_data):
+        avatar = validated_data.pop("avatar_file", None)
+        banner = validated_data.pop("banner_file", None)
+
+        instance = super().update(instance, validated_data)
+
+        if avatar:
+            ext = os.path.splitext(avatar.name)[1].lower() or ".jpg"
+            filename = f"avatars/{uuid.uuid4().hex}{ext}"
+            instance.avatar_url = default_storage.url(
+                default_storage.save(filename, avatar)
+            )
+
+        if banner:
+            ext = os.path.splitext(banner.name)[1].lower() or ".jpg"
+            filename = f"banners/{uuid.uuid4().hex}{ext}"
+            instance.banner_url = default_storage.url(
+                default_storage.save(filename, banner)
+            )
+
+        if avatar or banner:
+            instance.save(update_fields=["avatar_url", "banner_url"])
+
+        return instance
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+
+        for field in ("avatar_url", "banner_url"):
+            url = data.get(field)
+            if request and url and url.startswith(settings.MEDIA_URL):
+                data[field] = request.build_absolute_uri(url)
+
+        return data
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
