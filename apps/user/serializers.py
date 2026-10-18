@@ -55,7 +55,7 @@ def run_password_validators(password, user=None):
         raise serializers.ValidationError(list(exc.messages))
 
 
-# ─── Register / login / password ──────────────────────────────────────────────
+# ─── Register / login / password / Forget  ──────────────────────────────────────────────
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, style={"input_type": "password"})
 
@@ -131,6 +131,8 @@ class ChangePasswordSerializer(serializers.Serializer):
             )
         return attrs
 
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
 
 # ─── Profiles ─────────────────────────────────────────────────────────────────
 class UserMeSerializer(serializers.ModelSerializer):
@@ -190,3 +192,20 @@ class UserProfileSerializer(serializers.ModelSerializer):
         return Review.objects.filter(
             user=obj, deleted_at__isnull=True, status=Review.Status.PUBLISHED
         ).count()
+
+# ── ForgetPassword and Reset Password serializers ────────────────
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class ResetLinkSerializer(serializers.Serializer):
+    uid = serializers.CharField()
+    token = serializers.CharField()
+
+
+class SetNewPasswordSerializer(serializers.Serializer):
+    new_password = serializers.CharField(write_only=True)
+
+    def validate_new_password(self, value):
+        run_password_validators(value, user=self.context["user"])
+        return value
