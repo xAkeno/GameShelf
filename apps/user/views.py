@@ -21,6 +21,9 @@ from .serializers import (
     LoginSerializer,
     RegisterSerializer,
     UserMeSerializer,
+    ForgotPasswordSerializer,      
+    ResetLinkSerializer,           
+    SetNewPasswordSerializer,      
     UserProfileSerializer,
     VerifyEmailSerializer,
 )
@@ -83,6 +86,31 @@ def log_failed_login(request, username) -> None:
         path=request.path[:255],
     )
 
+password_reset_token = PasswordResetTokenGenerator()  # stops working once the password changes
+
+
+def send_password_reset_email(user) -> None:
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = password_reset_token.make_token(user)
+    link = f"{settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}"
+    send_mail(
+        subject="Reset your GameShelf password",
+        message=(
+            f"Hi {user.username},\n\n"
+            f"Use this link to choose a new password:\n{link}\n\n"
+            "If you didn't request this, you can ignore this email."
+        ),
+        from_email=None,
+        recipient_list=[user.email],
+    )
+
+
+def get_reset_user(uid: str, token: str):
+    try:
+        user = User.objects.get(pk=force_str(urlsafe_base64_decode(uid)), is_active=True)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        return None
+    return user if password_reset_token.check_token(user, token) else None
 
 # ─── Views ────────────────────────────────────────────────────────────────────
 class AuthViewSet(viewsets.ViewSet):
@@ -96,6 +124,9 @@ class AuthViewSet(viewsets.ViewSet):
         "login": "login",
         "verify_email": "verification",
         "resend_verification": "verification",
+        "forgot_password": "password_forgot",
+        "reset_validate": "password_reset",
+        "reset_password": "password_reset",
     }
 
     def get_throttles(self):
@@ -163,6 +194,46 @@ class AuthViewSet(viewsets.ViewSet):
         send_verification_email(request.user)
         return Response({"detail": "Verification email sent."})
 
+    @action(detail=False, methods=["post"], url_path="password/forgot")
+    def forgot_password(self, request):
+        serializer = ForgotPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = User.objects.filter(
+            email__iexact=serializer.validated_data["email"], is_active=True
+        ).first()
+        if user:
+            send_password_reset_email(user)
+        return Response({"detail": "If an account exists for that email, a reset link has been sent."})
+
+    @action(detail=False, methods=["post"], url_path="password/reset/validate")
+    def reset_validate(self, request):
+        serializer = ResetLinkSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        link = dict(serializer.validated_data)
+        if get_reset_user(**link) is None:
+            return Response(
+                {"detail": "This reset link is invalid or has expired."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        request.session["pw_reset"] = link
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=["post"], url_path="password/reset")
+    def reset_password(self, request):
+        link = request.session.get("pw_reset")
+        user = get_reset_user(**link) if link else None
+        if user is None:
+            return Response(
+                {"detail": "Your reset session expired. Please request a new link."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = SetNewPasswordSerializer(data=request.data, context={"user": user})
+        serializer.is_valid(raise_exception=True)
+        user.set_password(serializer.validated_data["new_password"])
+        user.save(update_fields=["password", "updated_at"])
+        request.session.pop("pw_reset", None)
+        return Response({"detail": "Password updated. You can now log in."})
+    
     @action(
         detail=False,
         methods=["post"],
