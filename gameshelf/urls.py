@@ -20,5 +20,5 @@ from . import api_views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/ping/', api_views.ping),
+    # path('api/ping/', api_views.ping),
 ]
