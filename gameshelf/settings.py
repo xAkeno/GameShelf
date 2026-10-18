@@ -65,10 +65,15 @@ CSRF_TRUSTED_ORIGINS = [
 REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 20,
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+    ],
     "DEFAULT_THROTTLE_RATES": {
         "register": "5/hour",
         "login": "10/minute",
         "verification": "5/hour",
+        "password_forgot": "5/hour",
+        "password_reset": "20/hour",
     },
 }
 MIDDLEWARE = [
@@ -111,8 +116,11 @@ DATABASES = {
         'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
-EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 FRONTEND_URL = "http://localhost:5173"
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"  
+CORS_ALLOWED_ORIGINS = ["http://localhost:5173"]
+CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = ["http://localhost:5173"]
 DEFAULT_FROM_EMAIL = "noreply@gameshelf.local"
 
 # Password validation
