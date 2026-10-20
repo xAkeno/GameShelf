@@ -211,12 +211,19 @@ class FriendViewSet(GenericViewSet):
         limit = int_param(request, "limit", 50, 1, 100)
         offset = int_param(request, "offset", 0, 0, 1_000_000)
 
+        paginated_rows = queryset[offset:offset + limit]
+
+        # Extract the other user from each friendship row (matching BlockViewSet style)
+        friend_users = [
+            row.friend if row.user_id == owner.id else row.user
+            for row in paginated_rows
+        ]
+
         return Response({
             "count": queryset.count(),
-            "results": FriendshipSerializer(
-                queryset[offset:offset + limit],
+            "results": UserBriefSerializer(
+                friend_users,
                 many=True,
-                context={"me": owner},
             ).data,
         })
 

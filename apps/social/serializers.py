@@ -10,7 +10,7 @@ User = get_user_model()
 class UserBriefSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ["id", "username", "nickname", "avatar_url"]
+        fields = ["id", "username", "nickname", "avatar_url" , "bio"]
 
 
 class SuggestedUserSerializer(serializers.ModelSerializer):
@@ -40,6 +40,7 @@ class FriendshipSerializer(serializers.ModelSerializer):
             "direction",
             "created_at",
             "updated_at",
+            
         ]
 
     def get_user(self, obj):
