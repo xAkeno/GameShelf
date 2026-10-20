@@ -5,6 +5,8 @@ from django.contrib.auth import logout as auth_logout
 from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.core.mail import send_mail
+from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.middleware.csrf import get_token
 from django.utils import timezone
 from django.utils.encoding import force_bytes, force_str
@@ -14,28 +16,100 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
-from apps.core.models import SecurityEvent
+from apps.core.models import Friendship, Notification, SecurityEvent
+from apps.user.serializers import can_view
 
 from .serializers import (
     ChangePasswordSerializer,
+    ForgotPasswordSerializer,
+    FriendshipSerializer,
     LoginSerializer,
+    NotificationSerializer,
     RegisterSerializer,
+    ResetLinkSerializer,
+    SetNewPasswordSerializer,
+    UserBriefSerializer,
     UserMeSerializer,
-    ForgotPasswordSerializer,      
-    ResetLinkSerializer,           
-    SetNewPasswordSerializer,      
     UserProfileSerializer,
+    UsernameSerializer,
     VerifyEmailSerializer,
 )
 
 User = get_user_model()
+Status = Friendship.SessionStatus if hasattr(Friendship, "SessionStatus") else Friendship.Status
+USERNAME_REGEX = r"[\w.@+-]+"
 
 
-# ─── Email verification and security log ──────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def int_param(request, name, default, low, high):
+    try:
+        value = int(request.query_params.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, value))
+
+
+def find_user(username):
+    if not username:
+        return None
+    return User.objects.filter(
+        username__iexact=str(username).strip(),
+        is_active=True,
+    ).first()
+
+
+def pair_filter(a, b):
+    return Q(user=a, friend=b) | Q(user=b, friend=a)
+
+
+def get_pair(a, b):
+    return (
+        Friendship.objects.filter(pair_filter(a, b))
+        .select_related("user", "friend")
+        .first()
+    )
+
+
+def notify(recipient, event, sender, row):
+    Notification.objects.create(
+        user=recipient,
+        type=Notification.Type.FRIEND_REQUEST,
+        payload={
+            "event": event,
+            "from": sender.username,
+            "friendship_id": row.id,
+        },
+    )
+
+
+def accept_request(row, me):
+    row.status = Status.ACCEPTED
+    row.save(update_fields=["status", "updated_at"])
+    notify(row.user, "accepted", me, row)
+
+
+def friends_queryset(owner, search=None):
+    queryset = (
+        Friendship.objects.filter(status=Status.ACCEPTED)
+        .filter(Q(user=owner) | Q(friend=owner))
+        .filter(user__is_active=True, friend__is_active=True)
+        .select_related("user", "friend")
+    )
+
+    if search:
+        queryset = queryset.filter(
+            Q(user=owner, friend__username__icontains=search)
+            | Q(user=owner, friend__nickname__icontains=search)
+            | Q(friend=owner, user__username__icontains=search)
+            | Q(friend=owner, user__nickname__icontains=search)
+        )
+
+    return queryset.order_by("-updated_at", "-id")
+
+
+# ─── Email Verification & Password Reset ──────────────────────────────────────
 class EmailVerificationTokenGenerator(PasswordResetTokenGenerator):
-    """One-time token: it stops working once email_verified_at is set,
-    or if the user's email changes."""
-
     key_salt = "users.tokens.EmailVerificationTokenGenerator"
 
     def _make_hash_value(self, user, timestamp):
@@ -56,13 +130,12 @@ def send_verification_email(user) -> None:
             f"Confirm your email address to finish setting up your account:\n{link}\n\n"
             "If you didn't create a GameShelf account, you can ignore this email."
         ),
-        from_email=None,  # uses DEFAULT_FROM_EMAIL
+        from_email=None,
         recipient_list=[user.email],
     )
 
 
 def confirm_email(uid: str, token: str):
-    """Returns the user if the link is valid, otherwise None."""
     try:
         user = User.objects.get(pk=force_str(urlsafe_base64_decode(uid)))
     except (TypeError, ValueError, OverflowError, User.DoesNotExist):
@@ -76,8 +149,6 @@ def confirm_email(uid: str, token: str):
 
 
 def log_failed_login(request, username) -> None:
-    """Security log for failed logins. Stores the user (if the name exists) and the IP,
-    never the password or the text that was typed."""
     user = User.objects.filter(username__iexact=str(username or "")[:150]).first()
     SecurityEvent.objects.create(
         event_type=SecurityEvent.EventType.LOGIN_FAILED,
@@ -86,7 +157,8 @@ def log_failed_login(request, username) -> None:
         path=request.path[:255],
     )
 
-password_reset_token = PasswordResetTokenGenerator()  # stops working once the password changes
+
+password_reset_token = PasswordResetTokenGenerator()
 
 
 def send_password_reset_email(user) -> None:
@@ -112,13 +184,11 @@ def get_reset_user(uid: str, token: str):
         return None
     return user if password_reset_token.check_token(user, token) else None
 
-# ─── Views ────────────────────────────────────────────────────────────────────
-class AuthViewSet(viewsets.ViewSet):
-    """/auth/csrf, register, login, logout, verify-email, resend-verification, password/change"""
 
+# ─── Auth ViewSet ─────────────────────────────────────────────────────────────
+class AuthViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]
-    # action name -> rate in REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]
     throttle_scopes = {
         "register": "register",
         "login": "login",
@@ -135,7 +205,6 @@ class AuthViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"], authentication_classes=[])
     def csrf(self, request):
-        """Call once when the React app starts so the browser gets the csrftoken cookie."""
         get_token(request)
         return Response({"detail": "CSRF cookie set."})
 
@@ -163,7 +232,7 @@ class AuthViewSet(viewsets.ViewSet):
                 {"detail": f"Your account is suspended until {user.suspended_until:%Y-%m-%d}."},
                 status=status.HTTP_403_FORBIDDEN,
             )
-        auth_login(request, user)  # creates the session cookie
+        auth_login(request, user)
         return Response(UserMeSerializer(user).data)
 
     @action(detail=False, methods=["post"], permission_classes=[permissions.IsAuthenticated])
@@ -233,7 +302,7 @@ class AuthViewSet(viewsets.ViewSet):
         user.save(update_fields=["password", "updated_at"])
         request.session.pop("pw_reset", None)
         return Response({"detail": "Password updated. You can now log in."})
-    
+
     @action(
         detail=False,
         methods=["post"],
@@ -245,18 +314,22 @@ class AuthViewSet(viewsets.ViewSet):
         serializer.is_valid(raise_exception=True)
         request.user.set_password(serializer.validated_data["new_password"])
         request.user.save(update_fields=["password", "updated_at"])
-        update_session_auth_hash(request, request.user)  # keeps this session logged in
+        update_session_auth_hash(request, request.user)
         return Response({"detail": "Password changed."})
 
 
+# ─── User & Consolidated Social ViewSet ───────────────────────────────────────
 class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
-    """/users/<username>/ is the public profile, /users/me/ is the logged-in user."""
+    """
+    Consolidated ViewSet for user profiles, me, suggested players, 
+    friends, friend requests, and blocking.
+    """
 
     queryset = User.objects.filter(is_active=True)
     serializer_class = UserProfileSerializer
     permission_classes = [permissions.AllowAny]
     lookup_field = "username"
-    lookup_value_regex = r"[\w.@+-]+"  # usernames may contain . @ + -
+    lookup_value_regex = USERNAME_REGEX
 
     @action(
         detail=False,
@@ -265,10 +338,243 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
         serializer_class=UserMeSerializer,
     )
     def me(self, request):
-        """GET the current user, PATCH profile and privacy fields."""
         if request.method == "PATCH":
             serializer = self.get_serializer(request.user, data=request.data, partial=True)
             serializer.is_valid(raise_exception=True)
             serializer.save()
             return Response(serializer.data)
         return Response(self.get_serializer(request.user).data)
+
+    # ─── Suggested Players ────────────────────────────────────────────────────
+    @action(
+        detail=False,
+        methods=["get"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="suggested-players",
+    )
+    def suggested_players(self, request):
+        me = request.user
+        queryset = User.objects.filter(is_active=True).exclude(pk=me.pk)
+
+        relationships = Friendship.objects.filter(Q(user=me) | Q(friend=me))
+        related_ids = {me.id}
+        for row in relationships.only("user_id", "friend_id"):
+            related_ids.add(row.friend_id if row.user_id == me.id else row.user_id)
+
+        queryset = queryset.exclude(pk__in=related_ids)
+        search = request.query_params.get("search", "").strip()
+        if search:
+            queryset = queryset.filter(Q(username__icontains=search) | Q(nickname__icontains=search))
+
+        queryset = queryset.order_by("username", "id")
+        total = queryset.count()
+        limit = int_param(request, "limit", 50, 1, 100)
+        offset = int_param(request, "offset", 0, 0, 1_000_000)
+
+        return Response({
+            "count": total,
+            "results": UserBriefSerializer(
+                queryset[offset:offset + limit], 
+                many=True, 
+                context={"request": request}
+            ).data,
+        })
+        # ─── Friends & Unfriend ───────────────────────────────────────────────────
+    @action(
+        detail=False,
+        methods=["get", "delete"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path=r"friends(?:/(?P<username>[\w.@+-]+))?",
+    )
+    def friends(self, request, username=None):
+        me = request.user
+
+        if request.method == "DELETE":
+            other = find_user(username)
+            row = get_pair(me, other) if other else None
+            if row is None or row.status != Status.ACCEPTED:
+                return Response({"detail": "You are not friends with this user."}, status=status.HTTP_404_NOT_FOUND)
+            row.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        # GET Friends List
+        search = request.query_params.get("search", "").strip()
+        queryset = friends_queryset(me, search)
+        limit = int_param(request, "limit", 100, 1, 100)
+        offset = int_param(request, "offset", 0, 0, 1_000_000)
+        paginated_rows = queryset[offset:offset + limit]
+
+        friend_users = [row.friend if row.user_id == me.id else row.user for row in paginated_rows]
+
+        return Response({
+            "count": queryset.count(),
+            "results": UserBriefSerializer(
+                friend_users, 
+                many=True, 
+                context={"request": request}
+            ).data,
+        })
+
+    # ─── Friend Requests ──────────────────────────────────────────────────────
+    @action(
+        detail=False,
+        methods=["get", "post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="friend-requests",
+    )
+    def friend_requests(self, request):
+        me = request.user
+
+        if request.method == "POST":
+            serializer = UsernameSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            target = find_user(serializer.validated_data["username"])
+
+            if target is None:
+                return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            if target.pk == me.pk:
+                return Response({"detail": "You can't send a friend request to yourself."}, status=status.HTTP_400_BAD_REQUEST)
+
+            existing = get_pair(me, target)
+            if existing is not None:
+                if existing.status == Status.BLOCKED:
+                    message = "You blocked this user. Unblock them first." if existing.user_id == me.id else "User not found."
+                    return Response({"detail": message}, status=status.HTTP_400_BAD_REQUEST if existing.user_id == me.id else status.HTTP_404_NOT_FOUND)
+                if existing.status == Status.ACCEPTED:
+                    return Response({"detail": "You are already friends."}, status=status.HTTP_400_BAD_REQUEST)
+                if existing.user_id == me.id:
+                    return Response({"detail": "Friend request already sent."}, status=status.HTTP_400_BAD_REQUEST)
+
+                # The other user already requested us: accept it automatically
+                with transaction.atomic():
+                    accept_request(existing, me)
+                return Response(FriendshipSerializer(existing, context={"me": me}).data)
+
+            try:
+                with transaction.atomic():
+                    row = Friendship.objects.create(user=me, friend=target, status=Status.PENDING)
+                    notify(target, "request", me, row)
+            except IntegrityError:
+                return Response({"detail": "A request between you two already exists."}, status=status.HTTP_400_BAD_REQUEST)
+
+            return Response(FriendshipSerializer(row, context={"me": me}).data, status=status.HTTP_201_CREATED)
+
+        # GET Incoming / Outgoing Friend Requests
+        direction = request.query_params.get("direction", "incoming")
+        if direction == "outgoing":
+            rows = Friendship.objects.filter(user=me, status=Status.PENDING)
+        elif direction == "incoming":
+            rows = Friendship.objects.filter(friend=me, status=Status.PENDING)
+        else:
+            return Response({"detail": "direction must be incoming or outgoing."}, status=status.HTTP_400_BAD_REQUEST)
+
+        rows = rows.filter(user__is_active=True, friend__is_active=True).select_related("user", "friend").order_by("-created_at")
+
+        return Response({
+            "count": rows.count(),
+            "results": FriendshipSerializer(
+                rows, 
+                many=True, 
+                context={"me": me, "request": request}
+            ).data,
+        })
+
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="friend-requests/(?P<pk>\\d+)/accept",
+    )
+    def accept_friend_request(self, request, username=None, pk=None):
+        # Note: DRF maps pk from the custom url path
+        pass # Handled via standard viewset if routed, or keep separate endpoint logic below
+
+    # Alternatively, use detail=False for explicit ID actions:
+    @action(
+        detail=False,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path=r"friend-requests/(?P<pk>\d+)/accept",
+    )
+    def accept_request_action(self, request, pk=None):
+        with transaction.atomic():
+            row = Friendship.objects.select_for_update().filter(pk=pk, friend=request.user, status=Status.PENDING).first()
+            if not row:
+                return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
+            accept_request(row, request.user)
+        return Response(FriendshipSerializer(row, context={"me": request.user}).data)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path=r"friend-requests/(?P<pk>\d+)/decline",
+    )
+    def decline_request_action(self, request, pk=None):
+        row = Friendship.objects.filter(pk=pk, friend=request.user, status=Status.PENDING).first()
+        if not row:
+            return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
+        row.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path=r"friend-requests/(?P<pk>\d+)/cancel",
+    )
+    def cancel_request_action(self, request, pk=None):
+        row = Friendship.objects.filter(pk=pk, user=request.user, status=Status.PENDING).first()
+        if not row:
+            return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
+        row.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # ─── Blocking ─────────────────────────────────────────────────────────────
+    @action(
+        detail=False,
+        methods=["get", "post", "delete"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path=r"blocks(?:/(?P<username>[\w.@+-]+))?",
+    )
+    def blocks(self, request, username=None):
+        me = request.user
+
+        if request.method == "DELETE":
+            other = find_user(username)
+            row = Friendship.objects.filter(user=me, friend=other, status=Status.BLOCKED).first() if other else None
+            if row is None:
+                return Response({"detail": "You haven't blocked this user."}, status=status.HTTP_404_NOT_FOUND)
+            row.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        if request.method == "POST":
+            serializer = UsernameSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            target = find_user(serializer.validated_data["username"])
+
+            if target is None or target.pk == me.pk:
+                return Response({"detail": "Invalid user target."}, status=status.HTTP_400_BAD_REQUEST)
+
+            existing = get_pair(me, target)
+            if existing and existing.status == Status.BLOCKED and existing.user_id == me.id:
+                return Response(UserBriefSerializer(target).data)
+
+            with transaction.atomic():
+                Friendship.objects.filter(pair_filter(me, target)).delete()
+                row = Friendship.objects.create(user=me, friend=target, status=Status.BLOCKED)
+
+            return Response(UserBriefSerializer(target).data, status=status.HTTP_201_CREATED)
+
+        # GET Blocks List
+        rows = Friendship.objects.filter(user=me, status=Status.BLOCKED).select_related("friend").order_by("-updated_at")
+        blocked_users = [row.friend for row in rows]
+
+        return Response({
+            "count": len(blocked_users),
+            "results": UserBriefSerializer(
+                blocked_users, 
+                many=True, 
+                context={"request": request}
+            ).data,
+        })
