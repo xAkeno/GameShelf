@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "apps.analytics",
     "apps.moderation",
     "apps.social",
+    'django_extensions',
 ]
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
