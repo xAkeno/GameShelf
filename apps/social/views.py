@@ -283,6 +283,9 @@ class FriendViewSet(GenericViewSet):
 # ---------------------------------------------------------------------
 
 class FriendRequestViewSet(GenericViewSet):
+    serializer_class = UsernameSerializer
+
+
     """
     GET /friend-requests/?direction=incoming|outgoing
     POST /friend-requests/ {"username": "..."}
@@ -293,7 +296,11 @@ class FriendRequestViewSet(GenericViewSet):
 
     permission_classes = [permissions.IsAuthenticated]
     throttle_classes = [ScopedRateThrottle]
-
+    def get_serializer_class(self):
+        if self.action in ("accept", "decline", "cancel", "list"):
+            return FriendshipSerializer
+        return UsernameSerializer
+    
     def get_throttles(self):
         self.throttle_scope = (
             "friend_request" if self.action == "create" else None
