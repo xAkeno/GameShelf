@@ -166,4 +166,4 @@ DEFAULT_FROM_EMAIL = "noreply@gameshelf.local"
 
 
 # ─── 14. THIRD-PARTY API KEYS ────────────────────────────────────────────────
-STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "5D48239956EB027F5F31D265CD43BD9A")
+STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "86D0AF9A74DB5528C3CBAE796F7DF4F8")
