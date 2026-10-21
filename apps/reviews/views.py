@@ -323,7 +323,14 @@ def review_detail(request, review_id):
 
     serializer = ReviewWriteSerializer(review, data=request.data, partial=True)
     serializer.is_valid(raise_exception=True)
-    serializer.save()
+
+    changed = any(
+        field in serializer.validated_data
+        and serializer.validated_data[field] != getattr(review, field)
+        for field in ("title", "content", "contains_spoilers")
+    )
+    if changed:
+        serializer.save(edited_at=timezone.now())
 
     review = _reviews_qs(request).get(pk=review.pk)
     return Response(ReviewSerializer(review, context={"request": request}).data)
@@ -488,7 +495,7 @@ def review_comments(request, review_id):
 @api_view(["PATCH", "DELETE"])
 @permission_classes([IsAuthenticatedOrReadOnly])
 def comment_detail(request, comment_id):
-    """PATCH /comments/<id>/ {content} (owner)  |  DELETE (owner, soft delete)"""
+    """PATCH /reviews/comments/<id>/ {content} (owner)  |  DELETE (owner, soft delete)"""
     comment = _get_comment_or_404(comment_id)
     if comment.user_id != request.user.id:
         return _forbidden()
@@ -500,8 +507,12 @@ def comment_detail(request, comment_id):
 
     serializer = CommentEditSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-    comment.content = serializer.validated_data["content"]
-    comment.save(update_fields=["content"])
+    new_content = serializer.validated_data["content"]
+
+    if new_content != comment.content:
+        comment.content = new_content
+        comment.edited_at = timezone.now()
+        comment.save(update_fields=["content", "edited_at"])
 
     comment = _comments_qs(request).get(pk=comment.pk)
     return Response(CommentSerializer(comment, context={"request": request}).data)

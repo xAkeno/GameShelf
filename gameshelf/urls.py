@@ -25,7 +25,7 @@ urlpatterns = [
     path("api/v1/games/", include("apps.games.urls")),
     path("api/v1/list/", include("apps.library.urls")),
     path("api/v1/reviews/", include("apps.reviews.urls")),
-
+    path("api/v1/moderation/", include("apps.moderation.urls")),
 ]
 if settings.DEBUG:
     urlpatterns += static(
