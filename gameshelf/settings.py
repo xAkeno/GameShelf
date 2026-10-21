@@ -93,6 +93,7 @@ DATABASES = {
 }
 
 
+
 # ─── 8. AUTHENTICATION & PASSWORD VALIDATION ──────────────────────────────────
 AUTH_USER_MODEL = "core.User"
 
