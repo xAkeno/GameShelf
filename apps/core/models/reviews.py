@@ -38,6 +38,7 @@ class Review(TimeStampedModel, SoftDeleteModel):
     content = models.TextField()  # sanitize server-side
     contains_spoilers = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PUBLISHED)
+    edited_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "reviews"
@@ -74,7 +75,7 @@ class ReviewComment(TimeStampedModel, SoftDeleteModel):
     )
     content = models.TextField()  # text only, no links (validate in the serializer)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PUBLISHED)
-
+    edited_at = models.DateTimeField(null=True, blank=True)
     class Meta:
         db_table = "review_comments"
         indexes = [models.Index(fields=["review", "created_at"], name="comment_review_created_idx")]

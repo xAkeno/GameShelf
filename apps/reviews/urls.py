@@ -14,8 +14,11 @@ from .views import (
 urlpatterns = [
     # Ratings (1-10)
     path("ratings/<int:app_id>/", game_rating, name="game-rating"),
-    # GameShelf reviews
-    path("<int:app_id>/", game_reviews, name="game-reviews"),
+
+    # Per-game GameShelf reviews (own prefix so it can't clash with review ids)
+    path("steam/<int:app_id>/", game_reviews, name="game-reviews"),
+
+    # Per-review
     path("<int:review_id>/", review_detail, name="review-detail"),
     path("<int:review_id>/like/", review_like, name="review-like"),
     path(
@@ -23,9 +26,11 @@ urlpatterns = [
         review_comments,
         name="review-comments",
     ),
+
     # Comments
     path("comments/<int:comment_id>/", comment_detail, name="comment-detail"),
     path("comments/<int:comment_id>/like/", comment_like, name="comment-like"),
+
     # Third-party reviews
     path(
         "external-reviews/<int:app_id>/",
