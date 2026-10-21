@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     BlockViewSet,
+    CommunityPlaylistViewSet,
     NotificationViewSet,
     FriendViewSet,
     FriendRequestViewSet,
@@ -27,6 +28,11 @@ router.register(
     "notifications",
     NotificationViewSet,
     basename="notifications",
+)
+router.register(
+    "playlists",
+    CommunityPlaylistViewSet,
+    basename="community-playlists",
 )
 
 urlpatterns = [
