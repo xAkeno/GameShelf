@@ -1,7 +1,7 @@
 import requests
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
-from django.db.models import Count
+from django.db.models import Case, Count, IntegerField, Value, When
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.text import slugify
@@ -22,11 +22,29 @@ from .serializers import (
     AddToListSerializer,
     UpdateListEntrySerializer,
     UserGameListSerializer,
+    CreatePlaylistSerializer,
+    PlaylistGameSearchSerializer,
 )
 
 Status = UserGameList.Status
 STEAM = "steam"
 
+STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
+
+
+def _steam_search(term):
+    key = f"steam:search:{term.lower()}"
+    items = cache.get(key)
+    if items is None:
+        resp = requests.get(
+            STEAM_SEARCH_URL,
+            params={"term": term, "l": "english", "cc": "us"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        cache.set(key, items, 300)
+    return items
 
 def _entries_for(user):
     return (
@@ -218,3 +236,81 @@ def user_game_list_status(request, app_id):
         return Response({"in_list": False})
 
     return Response({"in_list": True, **UserGameListSerializer(entry).data})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def create_playlist(request):
+    serializer = CreatePlaylistSerializer(data=request.data, context={"request": request})
+    serializer.is_valid(raise_exception=True)
+
+    games = []
+    try:
+        for app_id in serializer.validated_data["steam_app_ids"]:
+            game = _get_or_create_game(app_id)
+            if game is None:
+                return Response(
+                    {"steam_app_ids": [f"Game not found on Steam (app id {app_id})."]},
+                    status=http.HTTP_400_BAD_REQUEST,
+                )
+            games.append(game)
+    except requests.RequestException:
+        return Response(
+            {"error": "Unable to fetch game details from Steam."},
+            status=http.HTTP_502_BAD_GATEWAY,
+        )
+
+    try:
+        with transaction.atomic():
+            playlist = serializer.save(games=games)
+    except IntegrityError:
+        return Response(
+            {"error": "A playlist with this title already exists."},
+            status=http.HTTP_409_CONFLICT,
+        )
+
+    return Response(
+        {"id": playlist.id, "title": playlist.title, "visibility": playlist.visibility},
+        status=http.HTTP_201_CREATED,
+    )
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def search_playlist_games(request):
+    """GET /playlists/games/?search=<title> -> [{appid, title, cover}]"""
+    search = (request.query_params.get("search") or "").strip()
+    if len(search) < 2:
+        return Response({"results": []})
+
+    try:
+        limit = min(max(int(request.query_params.get("limit", 20)), 1), 50)
+    except (TypeError, ValueError):
+        limit = 20
+
+    try:
+        items = _steam_search(search)
+        results = [
+            {
+                "appid": item["id"],
+                "title": item["name"],
+                "cover": f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{item['id']}/header.jpg",
+            }
+            for item in items
+            if item.get("type") in (None, "app") and item.get("id") and item.get("name")
+        ][:limit]
+        return Response({"results": results})
+    except (requests.RequestException, ValueError):
+        pass
+
+    # Fallback: games already in our DB
+    games = (
+        Game.objects.filter(title__icontains=search, external_ids__source=STEAM)
+        .prefetch_related("external_ids")
+        .distinct()[:limit]
+    )
+    results = []
+    for g in games:
+        ext = next((e for e in g.external_ids.all() if e.source == STEAM), None)
+        if ext and str(ext.external_id).isdigit():
+            results.append({"appid": int(ext.external_id), "title": g.title, "cover": g.cover_image_url or ""})
+    return Response({"results": results})
