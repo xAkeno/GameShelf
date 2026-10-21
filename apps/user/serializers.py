@@ -9,7 +9,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Count, Q
 from rest_framework import serializers
 
-from apps.core.models import Friendship, Rating, Review, UserGameList
+from apps.core.models import Friendship, Rating, Review, UserGameList, Notification
 
 User = get_user_model()
 
@@ -24,64 +24,17 @@ def are_friends(a, b) -> bool:
         .exists()
     )
 
+
 def can_view(owner, viewer, visibility: str) -> bool:
     """Whether `viewer` may see something `owner` marked public / friends / private."""
     if viewer is not None and viewer.is_authenticated:
-        if viewer.pk == owner.pk or viewer.is_moderator:
+        if viewer.pk == owner.pk or getattr(viewer, "is_moderator", False):
             return True
     if visibility == "public":
         return True
     if visibility == "friends":
         return are_friends(viewer, owner)
     return False
-
-avatar_file = serializers.ImageField(
-    write_only=True, required=False
-)
-banner_file = serializers.ImageField(
-    write_only=True, required=False
-)
-
-def update(self, instance, validated_data):
-    avatar = validated_data.pop("avatar_file", None)
-    banner = validated_data.pop("banner_file", None)
-
-    instance = super().update(instance, validated_data)
-
-    if avatar:
-        ext = os.path.splitext(avatar.name)[1].lower()
-        filename = f"avatars/{uuid.uuid4().hex}{ext}"
-        instance.avatar_url = default_storage.url(
-            default_storage.save(filename, avatar)
-        )
-
-    if banner:
-        ext = os.path.splitext(banner.name)[1].lower()
-        filename = f"banners/{uuid.uuid4().hex}{ext}"
-        instance.banner_url = default_storage.url(
-            default_storage.save(filename, banner)
-        )
-
-    if avatar or banner:
-        instance.save(update_fields=["avatar_url", "banner_url"])
-
-    return instance
-
-def to_representation(self, instance):
-    data = super().to_representation(instance)
-    request = self.context.get("request")
-
-    for field in ("avatar_url", "banner_url"):
-        url = data.get(field)
-
-        if (
-            request
-            and url
-            and url.startswith(settings.MEDIA_URL)
-        ):
-            data[field] = request.build_absolute_uri(url)
-
-    return data
 
 
 def count_friends(user) -> int:
@@ -108,13 +61,98 @@ def run_password_validators(password, user=None):
         raise serializers.ValidationError(list(exc.messages))
 
 
-# ─── Register / login / password / Forget  ──────────────────────────────────────────────
+# ─── Base Mixin for Absolute Media URLs ────────────────────────────────────────
+class AbsoluteMediaURLMixin:
+    """Ensures avatar_url and banner_url are returned as absolute URIs when a request context is present."""
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+
+        for field in ("avatar_url", "banner_url"):
+            url = data.get(field)
+            if request and url and url.startswith(settings.MEDIA_URL):
+                data[field] = request.build_absolute_uri(url)
+
+        return data
+
+
+# ─── User Brief & Friend Serializers ──────────────────────────────────────────
+class UserBriefSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
+    """Compact user profile representation for friends lists, search, suggestions, and blocks."""
+    avatar_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ["id", "username", "nickname", "avatar_url", "bio"]
+
+    def get_avatar_url(self, obj):
+        if not obj.avatar_url:
+            return None
+        
+        request = self.context.get("request")
+        if request and obj.avatar_url.startswith(settings.MEDIA_URL):
+            return request.build_absolute_uri(obj.avatar_url)
+        
+        # If media URL is stored relative without leading domain
+        if request and not obj.avatar_url.startswith("http"):
+            return request.build_absolute_uri(obj.avatar_url)
+            
+        return obj.avatar_url
+
+
+class FriendshipSerializer(serializers.ModelSerializer):
+    """Represent a friendship relationship or pending request from the logged-in user's perspective."""
+    user = serializers.SerializerMethodField()
+    direction = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Friendship
+        fields = ["id", "user", "status", "direction", "created_at", "updated_at"]
+
+    def get_user(self, obj):
+        me = self.context.get("me")
+        if not me:
+            return UserBriefSerializer(obj.friend, context=self.context).data
+        other = obj.friend if obj.user_id == me.id else obj.user
+        return UserBriefSerializer(other, context=self.context).data
+
+    def get_direction(self, obj):
+        me = self.context.get("me")
+        if not me or obj.status != Friendship.Status.PENDING:
+            return None
+        return "outgoing" if obj.user_id == me.id else "incoming"
+
+
+class FriendshipSerializer(serializers.ModelSerializer):
+    """Represent a friendship relationship or pending request from the logged-in user's perspective."""
+    user = serializers.SerializerMethodField()
+    direction = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Friendship
+        fields = ["id", "user", "status", "direction", "created_at", "updated_at"]
+
+    def get_user(self, obj):
+        me = self.context.get("me")
+        if not me:
+            return UserBriefSerializer(obj.friend).data
+        other = obj.friend if obj.user_id == me.id else obj.user
+        return UserBriefSerializer(other, context=self.context).data
+
+    def get_direction(self, obj):
+        me = self.context.get("me")
+        if not me or obj.status != Friendship.Status.PENDING:
+            return None
+        return "outgoing" if obj.user_id == me.id else "incoming"
+
+
+# ─── Register / Login / Password ──────────────────────────────────────────────
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, style={"input_type": "password"})
 
     class Meta:
         model = User
-        fields = ["username", "email", "password",]
+        fields = ["username", "email", "password"]
         extra_kwargs = {
             "username": {"min_length": 3},
             "email": {"required": True, "allow_blank": False},
@@ -158,7 +196,7 @@ class LoginSerializer(serializers.Serializer):
             username=attrs["username"],
             password=attrs["password"],
         )
-        if user is None:  # wrong credentials, or the account is inactive
+        if user is None:
             raise serializers.ValidationError("Incorrect username or password.")
         attrs["user"] = user
         return attrs
@@ -184,25 +222,23 @@ class ChangePasswordSerializer(serializers.Serializer):
             )
         return attrs
 
-class ForgotPasswordSerializer(serializers.Serializer):
-    email = serializers.EmailField()
 
 # ─── Profiles ─────────────────────────────────────────────────────────────────
-class UserMeSerializer(serializers.ModelSerializer):
-    """The logged-in user's own account. Only profile and privacy fields are editable."""
+class UserMeSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
+    """The logged-in user's own account. Profile and privacy fields are editable."""
 
     email_verified = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(source="date_joined", read_only=True)
     avatar_file = serializers.ImageField(write_only=True, required=False)
-    banner_file = serializers.ImageField(write_only=True, required=False)   
+    banner_file = serializers.ImageField(write_only=True, required=False)
 
     class Meta:
         model = User
         fields = [
             "id", "username", "email", "email_verified", "role",
             "nickname", "bio", "avatar_url", "banner_url",
-            "library_visibility", "friends_visibility", "created_at","avatar_file",
-            "banner_file",
+            "library_visibility", "friends_visibility", "created_at",
+            "avatar_file", "banner_file",
         ]
         read_only_fields = ["id", "username", "email", "role"]
 
@@ -234,21 +270,9 @@ class UserMeSerializer(serializers.ModelSerializer):
 
         return instance
 
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        request = self.context.get("request")
 
-        for field in ("avatar_url", "banner_url"):
-            url = data.get(field)
-            if request and url and url.startswith(settings.MEDIA_URL):
-                data[field] = request.build_absolute_uri(url)
-
-        return data
-
-
-class UserProfileSerializer(serializers.ModelSerializer):
-    """What other people see. Email and role are never included, and the friend
-    count and library follow the owner's privacy settings."""
+class UserProfileSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
+    """What other people see. Email and role are excluded based on privacy settings."""
 
     joined = serializers.DateTimeField(source="date_joined", read_only=True)
     friend_count = serializers.SerializerMethodField()
@@ -285,7 +309,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             user=obj, deleted_at__isnull=True, status=Review.Status.PUBLISHED
         ).count()
 
-# ── ForgetPassword and Reset Password serializers ────────────────
+
+# ─── Password Reset & Utility Serializers ─────────────────────────────────────
 class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
@@ -301,3 +326,13 @@ class SetNewPasswordSerializer(serializers.Serializer):
     def validate_new_password(self, value):
         run_password_validators(value, user=self.context["user"])
         return value
+
+
+class UsernameSerializer(serializers.Serializer):
+    username = serializers.CharField(max_length=150)
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ["id", "type", "payload", "read_at", "created_at"]

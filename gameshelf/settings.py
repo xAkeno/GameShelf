@@ -75,6 +75,7 @@ REST_FRAMEWORK = {
         "verification": "5/hour",
         "password_forgot": "5/hour",
         "password_reset": "20/hour",
+        'friend_request': '20/hour',
     },
 }
 MIDDLEWARE = [
