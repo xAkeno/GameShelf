@@ -10,7 +10,12 @@ from rest_framework.generics import get_object_or_404
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import GenericViewSet
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.pagination import LimitOffsetPagination
+from rest_framework.permissions import AllowAny
 
+
+from apps.core.models import Playlist, PlaylistGame
 from apps.core.models import Friendship, Notification
 from apps.user.serializers import can_view
 
@@ -630,3 +635,100 @@ class NotificationViewSet(GenericViewSet):
         ).update(read_at=timezone.now())
 
         return Response({"marked_read": updated})
+
+# ---------------------------------------------------------------------
+#For game list
+# ---------------------------------------------------------------------
+
+
+class PlaylistPagination(LimitOffsetPagination):
+    default_limit = 12
+    max_limit = 50
+
+
+def _steam_id(game):
+    ext = next((e for e in game.external_ids.all() if e.source == "steam"), None)
+    try:
+        return int(ext.external_id) if ext else None
+    except (TypeError, ValueError):
+        return None
+
+
+class CommunityPlaylistViewSet(GenericViewSet):
+    """
+    GET /playlists/?search=<title>&user=<username>&limit=12&offset=0
+
+    Public, non-deleted playlists for the Community Playlists section.
+    """
+
+    permission_classes = [permissions.AllowAny]  # IsAuthenticated if Home is login-only
+    pagination_class = PlaylistPagination
+
+    def get_queryset(self):
+        queryset = (
+            Playlist.objects.filter(
+                deleted_at__isnull=True,
+                visibility="public",  # <- check this matches your model's value
+            )
+            .select_related("user")
+            .order_by("-id")
+        )
+
+        params = self.request.query_params
+
+        search = (params.get("search") or "").strip()
+        if search:
+            queryset = queryset.filter(title__icontains=search)
+
+        username = (params.get("user") or "").strip()
+        if username:
+            queryset = queryset.filter(user__username=username)
+
+        return queryset
+
+    def list(self, request):
+        page = self.paginate_queryset(self.get_queryset())
+
+        # One query for every game on this page, grouped by playlist.
+        links = (
+            PlaylistGame.objects.filter(playlist_id__in=[p.id for p in page])
+            .select_related("game")
+            .prefetch_related("game__external_ids", "game__genres")
+            .order_by("position")
+        )
+
+        games_by_playlist = {}
+        for link in links:
+            games_by_playlist.setdefault(link.playlist_id, []).append({
+                "id": link.game.id,
+                "title": link.game.title,
+                "steam_appid": _steam_id(link.game),
+                "cover_url": link.game.cover_image_url,
+                "genres": [g.name for g in link.game.genres.all()],
+                "position": link.position,
+                "note": getattr(link, "note", None),
+            })
+
+        results = []
+        for p in page:
+            games = games_by_playlist.get(p.id, [])
+            results.append({
+                "id": p.id,
+                "title": p.title,
+                "description": p.description,
+                "visibility": p.visibility,
+                "owner": {
+                    "id": p.user.id,
+                    "username": p.user.username,
+                    "nickname": getattr(p.user, "nickname", None),
+                    "avatar_url": getattr(p.user, "avatar_url", None),
+                },
+                "game_count": len(games),
+                "like_count": 0,        # TODO: wire to your likes table
+                "liked_by_me": False,   # TODO
+                "games": games,
+                "created_at": p.created_at,
+                "updated_at": p.updated_at,
+            })
+
+        return self.get_paginated_response(results)
