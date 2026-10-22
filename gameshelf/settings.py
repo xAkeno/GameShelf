@@ -4,6 +4,8 @@ Django settings for gameshelf project.
 
 import os
 from pathlib import Path
+from decouple import config
+# Build paths inside the project like this: BASE_DIR / 'subdir'.
 
 # ─── 1. CORE PATHS ───────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -48,6 +50,7 @@ INSTALLED_APPS = [
     "apps.social",
 ]
 
+STEAM_API_KEY = config("STEAM_API_KEY")
 
 # ─── 4. MIDDLEWARE ───────────────────────────────────────────────────────────
 MIDDLEWARE = [
