@@ -11,7 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 from pathlib import Path
-
+from decouple import config
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -55,7 +55,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:5174",
 ]
 
-STEAM_API_KEY = "5D48239956EB027F5F31D265CD43BD9A"
+STEAM_API_KEY = config("STEAM_API_KEY")
 
 CORS_ALLOW_CREDENTIALS = True
 
