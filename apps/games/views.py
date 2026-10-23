@@ -2,7 +2,8 @@ import hashlib
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
-
+import logging
+from apps.reviews.serializers import rating_stats_for
 import requests
 from django.conf import settings
 from django.core.cache import cache
@@ -17,10 +18,14 @@ from apps.games.serializers import (
     search_steam_store,
     search_steam_titles,
 )
+from django.db.models import Avg, Count
+from apps.core.models import Game, Rating
 
 
 DEFAULT_LIMIT = 12
 MAX_LIMIT = 100
+
+MAX_SUMMARY_IDS = 30
 
 DETAILS_CACHE_SECONDS = 60 * 60       # Steam rate-limits appdetails (~200 / 5 min)
 REVIEWS_CACHE_SECONDS = 60 * 10
@@ -57,6 +62,10 @@ SORT_BY = {
     "name": "Name_ASC",
 }
 
+ExternalId = Game._meta.get_field("external_ids").related_model
+
+STEAM_RATING_CACHE_SECONDS = 60 * 60 * 6 
+
 
 def _to_int(value, default, minimum=0):
     try:
@@ -75,13 +84,17 @@ def steam_game_list(request):
         MAX_LIMIT,
     )
     last_appid = _to_int(request.query_params.get("last_appid"), 0)
-
+ 
     result = get_steam_game_list(
         api_key=settings.STEAM_API_KEY,
         last_appid=last_appid,
         limit=limit,
     )
 
+    if request.query_params.get("expand") == "1":
+        app_ids = [g["appid"] for g in result.get("games", [])][:MAX_SUMMARY_IDS]
+        result = {**result, "games": _build_summaries(app_ids, request.user)}   # <- request.user
+ 
     return Response(result)
 
 
@@ -181,6 +194,131 @@ def _browse_card(app_id, details):
         "score": round(metacritic / 10, 1) if metacritic else None,
     }
 
+def _external_id_fields():
+    """Find the Steam-id table's field names without hardcoding them."""
+    model = Game._meta.get_field("external_ids").related_model
+    names = {f.name for f in model._meta.get_fields()}
+ 
+    def pick(*candidates):
+        return next((c for c in candidates if c in names), None)
+ 
+    source = pick("source", "provider", "platform", "store")
+    value = pick("external_id", "value", "identifier", "app_id", "steam_id", "key")
+    if not value:
+        raise RuntimeError(f"Unknown external id fields: {sorted(names)}")
+    return model, source, value
+ 
+ 
+def _game_ids_for(app_ids):
+    """{our Game id: steam app id} for the games we already know about."""
+    model, source_field, value_field = _external_id_fields()
+ 
+    links = model.objects.filter(**{f"{value_field}__in": [str(a) for a in app_ids]})
+    if source_field:
+        links = links.filter(**{f"{source_field}__iexact": "steam"})
+ 
+    return {
+        game_id: int(ext) for game_id, ext in links.values_list("game_id", value_field)
+    }
+ 
+ 
+def _ratings_for(game_to_app):
+    """GameShelf community average + count, one query."""
+    if not game_to_app:
+        return {}
+    rows = (
+        Rating.objects.filter(game_id__in=game_to_app.keys())
+        .values("game_id")
+        .annotate(average=Avg("score"), count=Count("id"))
+    )
+    return {
+        game_to_app[row["game_id"]]: {
+            "average": round(float(row["average"]), 1),
+            "count": row["count"],
+        }
+        for row in rows
+    }
+ 
+ 
+def _my_scores_for(user, game_to_app):
+    """The logged-in user's own scores {steam app id: score}. Empty if anonymous."""
+    if user is None or not user.is_authenticated or not game_to_app:
+        return {}
+    rows = Rating.objects.filter(
+        user=user, game_id__in=game_to_app.keys()
+    ).values_list("game_id", "score")
+    return {game_to_app[game_id]: score for game_id, score in rows}
+ 
+ 
+def _steam_rating_for(app_id):
+    """
+    Third-party rating: Steam's positive-review share, scaled to 0-10.
+    Cached server-side for 6 hours, so the Steam review API is hit at most
+    once per game per 6 hours, no matter how many users load the page.
+    """
+    key = f"steam:rating:{app_id}"
+    cached = cache.get(key)
+    if cached is not None:
+        return cached or None  # {} means "Steam has no reviews for this game"
+ 
+    try:
+        data = get_steam_game_reviews(app_id, num_per_page=1)
+    except requests.RequestException:
+        return None  # don't cache failures; try again next time
+ 
+    summary = data.get("summary") or {}
+    total = summary.get("total_reviews") or 0
+    positive = summary.get("total_positive") or 0
+ 
+    result = (
+        {
+            "score": round(positive / total * 10, 1),
+            "label": summary.get("review_score_desc") or "",
+            "total_reviews": total,
+        }
+        if total
+        else {}
+    )
+    cache.set(key, result, STEAM_RATING_CACHE_SECONDS)
+    return result or None
+ 
+ 
+def _summary_card(app_id, details, rating, steam_rating):
+    card = _browse_card(app_id, details)
+    card.update(
+        {
+            "short_description": details.get("short_description") or "",
+            "metacritic_score": (details.get("metacritic") or {}).get("score"),
+            "steam_rating": steam_rating,          # third-party (Steam)
+            "community_rating": rating["average"], # GameShelf average
+            "rating_count": rating["count"],
+            "my_score": rating["my_score"],        # your own rating
+        }
+    )
+    return card
+
+
+def _build_summaries(app_ids, user=None):
+    app_ids = list(dict.fromkeys(app_ids))  # de-dupe, keep order
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        details = list(executor.map(_details_for, app_ids))
+        steam_ratings = list(executor.map(_steam_rating_for, app_ids))
+
+    # A rating problem must never take the whole Home page down.
+    try:
+        stats = rating_stats_for(app_ids, user)
+    except Exception:
+        logger.exception("rating lookup failed")
+        stats = {}
+
+    empty = {"my_score": None, "average": None, "count": 0}
+
+    return [
+        _summary_card(app_id, d, stats.get(app_id, empty), steam)
+        for app_id, d, steam in zip(app_ids, details, steam_ratings)
+        if d and d.get("type") == "game"
+    ]
 
 def _search_pool(term, tag_id, platform_os, sort_by):
     """All title matches for a search, cached so paging doesn't re-scan Steam."""
@@ -277,3 +415,22 @@ def steam_game_browse(request):
             "results": cards,
         }
     )
+
+@api_view(["GET"])
+def steam_game_summaries(request):
+    raw = request.query_params.get("appids", "")
+    app_ids = [int(x) for x in raw.split(",") if x.strip().isdigit()]
+    app_ids = app_ids[:MAX_SUMMARY_IDS]
+
+    if not app_ids:
+        return Response({"results": []})
+
+    try:
+        results = _build_summaries(app_ids, request.user)   # <- request.user
+    except requests.RequestException:
+        return Response(
+            {"error": "Unable to fetch game details from Steam."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({"results": results})

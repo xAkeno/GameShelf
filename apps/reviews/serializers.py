@@ -2,8 +2,11 @@ import re
 
 from django.utils.html import strip_tags
 from rest_framework import serializers
+from django.db.models import Avg, Count
+from django.utils.html import strip_tags
+from rest_framework import serializers
 
-from apps.core.models import CommentAttachment, Review, ReviewComment
+from apps.core.models import CommentAttachment, Game, Rating, Review, ReviewComment
 
 # Comments are text-only: no links (see the model note on ReviewComment.content).
 LINK_PATTERN = re.compile(
@@ -22,6 +25,46 @@ def _is_mine(serializer, obj):
         request and request.user.is_authenticated and obj.user_id == request.user.id
     )
 
+def _game_to_app(app_ids):
+    """{Game id: steam app id} from the external_ids table (source + external_id)."""
+    model = Game._meta.get_field("external_ids").related_model
+    links = model.objects.filter(
+        source="steam", external_id__in=[str(a) for a in app_ids]
+    ).values_list("game_id", "external_id")
+    return {game_id: int(ext) for game_id, ext in links}
+
+
+def rating_stats_for(app_ids, user=None):
+    """
+    Batched version of _rating_stats for many Steam app ids at once.
+    Returns {app_id: {"my_score": int|None, "average": float|None, "count": int}}.
+    Read-only: never creates a Game or calls Steam.
+    """
+    stats = {a: {"my_score": None, "average": None, "count": 0} for a in app_ids}
+
+    game_to_app = _game_to_app(app_ids)
+    if not game_to_app:
+        return stats
+    game_ids = list(game_to_app)
+
+    rows = (
+        Rating.objects.filter(game_id__in=game_ids)
+        .values("game_id")
+        .annotate(average=Avg("score"), count=Count("id"))
+    )
+    for row in rows:
+        entry = stats[game_to_app[row["game_id"]]]
+        entry["average"] = round(float(row["average"]), 1)
+        entry["count"] = row["count"]
+
+    if user is not None and user.is_authenticated:
+        mine = Rating.objects.filter(user=user, game_id__in=game_ids).values_list(
+            "game_id", "score"
+        )
+        for game_id, score in mine:
+            stats[game_to_app[game_id]]["my_score"] = score
+
+    return stats
 
 # ---------------------------------------------------------------------------
 # Ratings
