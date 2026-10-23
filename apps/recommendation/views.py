@@ -23,7 +23,46 @@ from .serializers import (
     RecommendationSerializer,
     SimilarGameSerializer,
 )
+import json
 
+from functools import lru_cache
+from pathlib import Path
+
+from .jobs import _load_steam_games, RECOMMENDATION_DIR
+
+@lru_cache(maxsize=1)
+def steam_games():
+    return _load_steam_games()
+
+
+def load_recommendation_artifact(filename):
+    path = RECOMMENDATION_DIR / filename
+
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def steam_game_payload(appid):
+    game = steam_games().get(int(appid))
+
+    if not game:
+        return None
+
+    return {
+        "id": int(appid),
+        "appid": int(appid),
+        "title": game["name"],
+        "slug": None,
+        "cover_image_url": None,
+        "release_date": game["release_date"],
+        "genres": game["genres"],
+    }
 
 def active_run(algorithm: str):
     return ModelRun.objects.filter(algorithm=algorithm, is_active=True).first()
@@ -45,7 +84,12 @@ class RecommendationViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def list(self, request):
-        limit = int_param(request, "limit", 12, 1, 50)
+        try:
+            limit = int(request.query_params.get("limit", 10))
+        except (TypeError, ValueError):
+            limit = 10
+
+        limit = max(1, min(limit, 50))
         user = request.user
 
         if user.is_authenticated:
@@ -95,18 +139,38 @@ class SimilarGamesViewSet(viewsets.ViewSet):
     permission_classes = [permissions.AllowAny]
 
     def retrieve(self, request, pk=None):
-        game = get_object_or_404(Game, pk=pk)
-        limit = int_param(request, "limit", 12, 1, 50)
-        run = active_run("tfidf")
-        if not run:
+        try:
+            appid = int(pk)
+        except (TypeError, ValueError):
+            return Response(
+                {"results": [], "detail": "Invalid Steam app ID."},
+                status=400,
+            )
+
+        artifact = load_recommendation_artifact("tfidf_similarities.json")
+
+        if not artifact:
             return Response({"results": []})
-        rows = (
-            GameSimilarity.objects.filter(model_run=run, game=game)
-            .select_related("similar_game")
-            .prefetch_related("similar_game__genres")
-            .order_by("rank")[:limit]
-        )
-        return Response({"results": SimilarGameSerializer(rows, many=True).data})
+
+        limit = int_param(request, "limit", default=10, low=1, high=50)
+        similarities = artifact.get("games", {}).get(str(appid), [])
+
+        results = []
+
+        for item in similarities[:limit]:
+            game = steam_game_payload(item["appid"])
+
+            if game is None:
+                continue
+
+            results.append({
+                "game": game,
+                "score": item["score"],
+                "rank": item["rank"],
+                "reason": item.get("reason", {}),
+            })
+
+        return Response({"results": results})
 
 
 class TopGamesViewSet(viewsets.ViewSet):
@@ -118,7 +182,7 @@ class TopGamesViewSet(viewsets.ViewSet):
     def list(self, request):
         ordering = request.query_params.get("ordering", "rating")
         field = self.FIELDS.get(ordering, "bayesian_score")
-        limit = int_param(request, "limit", 20, 1, 100)
+        limit = int_param(request, "limit", default=10, low=1, high=50)
         offset = int_param(request, "offset", 0, 0, 1_000_000)
 
         queryset = GameScore.objects.select_related("game").prefetch_related("game__genres")
@@ -138,19 +202,72 @@ class ClusterViewSet(viewsets.ViewSet):
 
     permission_classes = [permissions.AllowAny]
 
-    def list(self, request):
-        clusters = Cluster.objects.filter(model_run__is_active=True, entity_type="game").order_by("-size")
-        return Response({"results": ClusterSerializer(clusters, many=True).data})
+    def list(self, request, *args, **kwargs):
+        artifact = load_recommendation_artifact("game_clusters.json")
 
-    def retrieve(self, request, pk=None):
-        cluster = get_object_or_404(Cluster, pk=pk, model_run__is_active=True, entity_type="game")
-        limit = int_param(request, "limit", 24, 1, 100)
-        members = (
-            ClusterMember.objects.filter(cluster=cluster, game__isnull=False)
-            .select_related("game")
-            .prefetch_related("game__genres")
-            .order_by("distance")[:limit]
+        if not artifact:
+            return Response([])
+
+        results = [
+            {
+                "id": cluster["id"],
+                "label": cluster["label"],
+                "size": cluster["size"],
+            }
+            for cluster in artifact.get("clusters", [])
+        ]
+
+        return Response(results)
+
+
+    def retrieve(self, request, pk=None, *args, **kwargs):
+        try:
+            cluster_id = int(pk)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "Invalid cluster ID."},
+                status=400,
+            )
+
+        artifact = load_recommendation_artifact("game_clusters.json")
+
+        if not artifact:
+            return Response(
+                {"detail": "Game clusters have not been generated yet."},
+                status=404,
+            )
+
+        cluster = next(
+            (
+                item
+                for item in artifact.get("clusters", [])
+                if item["id"] == cluster_id
+            ),
+            None,
         )
-        data = ClusterSerializer(cluster).data
-        data["games"] = ClusterMemberSerializer(members, many=True).data
-        return Response(data)
+
+        if cluster is None:
+            return Response(
+                {"detail": "Cluster not found."},
+                status=404,
+            )
+
+        games = []
+
+        for member in cluster.get("games", []):
+            game = steam_game_payload(member["appid"])
+
+            if game is None:
+                continue
+
+            games.append({
+                "game": game,
+                "distance": member["distance"],
+            })
+
+        return Response({
+            "id": cluster["id"],
+            "label": cluster["label"],
+            "size": cluster["size"],
+            "games": games,
+        })

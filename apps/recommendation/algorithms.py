@@ -277,16 +277,54 @@ def _distinct(points: np.ndarray) -> int:
     return len(np.unique(points.round(8), axis=0))
 
 
-def choose_k(points: np.ndarray, k_min: int = 2, k_max: int = 10, seed: int = 42) -> int:
-    """The number of clusters with the best silhouette score (how well separated they are)."""
-    best_k, best_score = k_min, -1.0
-    for k in range(k_min, min(k_max, points.shape[0] - 1, _distinct(points)) + 1):
-        labels = KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(points)
-        if len(set(labels)) < 2:
+def choose_k(points, k_min=2, k_max=10, seed=42):
+    import numpy as np
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    count = points.shape[0]
+
+    if count < 3:
+        raise NotEnoughData(
+            f"Need at least 3 items to choose clusters; found {count}."
+        )
+
+    # Evaluate possible cluster counts on a sample, not the full dataset.
+    sample_size = min(5000, count)
+    rng = np.random.default_rng(seed)
+
+    if count > sample_size:
+        indices = rng.choice(count, size=sample_size, replace=False)
+        sample = points[indices]
+    else:
+        sample = points
+
+    distinct_count = np.unique(sample, axis=0).shape[0]
+    upper_k = min(k_max, distinct_count - 1)
+
+    if upper_k < k_min:
+        return min(2, distinct_count)
+
+    best_k = k_min
+    best_score = -1.0
+
+    for k in range(k_min, upper_k + 1):
+        model = KMeans(
+            n_clusters=k,
+            random_state=seed,
+            n_init=10,
+        )
+        labels = model.fit_predict(sample)
+
+        if len(np.unique(labels)) < 2:
             continue
-        score = silhouette_score(points, labels)
+
+        score = silhouette_score(sample, labels)
+
         if score > best_score:
-            best_k, best_score = k, score
+            best_score = score
+            best_k = k
+
     return best_k
 
 
