@@ -1,7 +1,7 @@
 import requests
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
-from django.db.models import Case, Count, IntegerField, Value, When
+from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.text import slugify
@@ -11,11 +11,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.core.models import Game, GameExternalId, UserGameList
-
-# If the import above fails, GameExternalId/Game aren't exported in
-# apps/core/models/__init__.py. Use the explicit paths instead:
-# from apps.core.models.games import Game, GameExternalId
-# from apps.core.models.library import UserGameList
 from apps.games.serializers import get_steam_game_details
 
 from .serializers import (
@@ -23,12 +18,10 @@ from .serializers import (
     UpdateListEntrySerializer,
     UserGameListSerializer,
     CreatePlaylistSerializer,
-    PlaylistGameSearchSerializer,
 )
 
 Status = UserGameList.Status
 STEAM = "steam"
-
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 
 
@@ -46,6 +39,7 @@ def _steam_search(term):
         cache.set(key, items, 300)
     return items
 
+
 def _entries_for(user):
     return (
         UserGameList.objects.filter(user=user)
@@ -55,7 +49,6 @@ def _entries_for(user):
 
 
 def _apply_status(entry, new_status):
-    """Set the status and keep started_at / completed_at sensible."""
     today = timezone.localdate()
     entry.status = new_status
 
@@ -69,7 +62,6 @@ def _apply_status(entry, new_status):
 
 
 def _find_game(app_id):
-    """Local Game for a Steam app id, or None."""
     return Game.objects.filter(
         external_ids__source=STEAM,
         external_ids__external_id=str(app_id),
@@ -79,8 +71,7 @@ def _find_game(app_id):
 def _get_or_create_game(app_id):
     """
     Find the local Game for a Steam app id, creating it from Steam's data the
-    first time someone adds it. Returns None if Steam doesn't know the app.
-    May raise requests.RequestException.
+    first time someone adds it. Also imported by the user app for favorites.
     """
     game = _find_game(app_id)
     if game:
@@ -92,9 +83,6 @@ def _get_or_create_game(app_id):
 
     name = details.get("name") or f"Steam app {app_id}"
 
-    # The DB constraint requires every DLC to have a parent game. Use Steam's
-    # "fullgame" info if we already have that base game, otherwise store the
-    # entry as a base game so the add doesn't fail.
     game_type, parent = Game.GameType.BASE, None
     if details.get("type") == "dlc":
         try:
@@ -121,11 +109,19 @@ def _get_or_create_game(app_id):
                 last_synced_at=timezone.now(),
             )
     except IntegrityError:
-        # Another request created it first.
         game = _find_game(app_id)
         if game is None:
             raise
     return game
+
+
+def get_library_counts(user) -> dict:
+    """Helper method consumed by user profiles for library statistics."""
+    counts = {status: 0 for status in Status.values}
+    rows = UserGameList.objects.filter(user=user).values("status").annotate(total=Count("id"))
+    for row in rows:
+        counts[row["status"]] = row["total"]
+    return counts
 
 
 def _add_to_list(request):
@@ -153,7 +149,6 @@ def _add_to_list(request):
     _apply_status(entry, new_status)
     entry.save()
 
-    # Re-fetch so select/prefetch is applied for the serializer.
     entry = _entries_for(request.user).get(pk=entry.pk)
 
     return Response(
@@ -165,18 +160,11 @@ def _add_to_list(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def user_game_list(request):
-    """
-    GET  /list/?status=playing&search=hollow
-         -> { counts: {...}, results: [...] }
-    POST /list/  { steam_app_id, status }
-         -> create the entry, or change its status if it already exists
-    """
     if request.method == "POST":
         return _add_to_list(request)
 
     base = _entries_for(request.user)
 
-    # Counts always describe the whole list, regardless of filters.
     raw = {
         row["status"]: row["n"]
         for row in base.order_by().values("status").annotate(n=Count("id"))
@@ -200,7 +188,6 @@ def user_game_list(request):
 @api_view(["PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def user_game_list_entry(request, entry_id):
-    """PATCH /list/<id>/ (change status etc.)  |  DELETE (remove)."""
     entry = get_object_or_404(_entries_for(request.user), pk=entry_id)
 
     if request.method == "DELETE":
@@ -222,7 +209,6 @@ def user_game_list_entry(request, entry_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def user_game_list_status(request, app_id):
-    """GET /list/steam/<app_id>/  -> is this game in my list, and as what?"""
     entry = (
         _entries_for(request.user)
         .filter(
@@ -274,10 +260,10 @@ def create_playlist(request):
         status=http.HTTP_201_CREATED,
     )
 
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def search_playlist_games(request):
-    """GET /playlists/games/?search=<title> -> [{appid, title, cover}]"""
     search = (request.query_params.get("search") or "").strip()
     if len(search) < 2:
         return Response({"results": []})
@@ -302,7 +288,6 @@ def search_playlist_games(request):
     except (requests.RequestException, ValueError):
         pass
 
-    # Fallback: games already in our DB
     games = (
         Game.objects.filter(title__icontains=search, external_ids__source=STEAM)
         .prefetch_related("external_ids")

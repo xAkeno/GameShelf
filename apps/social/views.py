@@ -1,4 +1,8 @@
 
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from django.utils.text import slugify
+
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Q
@@ -13,9 +17,10 @@ from rest_framework.viewsets import GenericViewSet
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.permissions import AllowAny
+from rest_framework.exceptions import NotFound
 
 
-from apps.core.models import Playlist, PlaylistGame
+from apps.core.models import Playlist, PlaylistGame, Game
 from apps.core.models import Friendship, Notification
 from apps.user.serializers import can_view
 
@@ -31,6 +36,8 @@ User = get_user_model()
 Status = Friendship.Status
 USERNAME_REGEX = r"[\w.@+-]+"
 
+
+MAX_GENRE_SYNC = 12  # games looked up per page view
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -641,6 +648,7 @@ class NotificationViewSet(GenericViewSet):
 # ---------------------------------------------------------------------
 
 
+
 class PlaylistPagination(LimitOffsetPagination):
     default_limit = 12
     max_limit = 50
@@ -654,25 +662,166 @@ def _steam_id(game):
         return None
 
 
+def _fetch_steam_genres(appid):
+    """Genre names for one Steam app, e.g. ["Action", "Indie"]. [] on any failure."""
+    try:
+        res = requests.get(
+            "https://store.steampowered.com/api/appdetails",
+            params={"appids": appid, "filters": "genres", "l": "english"},
+            timeout=8,
+        )
+        entry = res.json().get(str(appid)) or {}
+        info = entry.get("data")
+        if not entry.get("success") or not isinstance(info, dict):
+            return []
+        return [
+            g["description"].strip()
+            for g in info.get("genres", [])
+            if g.get("description")
+        ]
+    except (requests.RequestException, ValueError, KeyError, AttributeError):
+        return []
+
+
+def _fill_missing_genres(links):
+    """Fetch genres from Steam for games that have none. True if anything was saved."""
+    todo = {}
+    for link in links:
+        game = link.game
+        if game.id in todo or game.genres.all():
+            continue
+        appid = _steam_id(game)
+        if appid:
+            todo[game.id] = (game, appid)
+        if len(todo) >= MAX_GENRE_SYNC:
+            break
+
+    if not todo:
+        return False
+
+    # Steam requests run in parallel; database writes stay in this thread.
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        names_list = list(pool.map(lambda item: _fetch_steam_genres(item[1]), todo.values()))
+
+    Genre = Game._meta.get_field("genres").related_model
+    has_slug = any(f.name == "slug" for f in Genre._meta.get_fields())
+
+    saved = False
+    for (game, _appid), names in zip(todo.values(), names_list):
+        genres = []
+        for name in names:
+            genre = Genre.objects.filter(name__iexact=name).first()
+            if genre is None:
+                kwargs = {"name": name}
+                if has_slug:
+                    kwargs["slug"] = slugify(name)
+                genre = Genre.objects.create(**kwargs)
+            genres.append(genre)
+
+        if genres:
+            game.genres.add(*genres)
+            saved = True
+
+    return saved
+
+
+def _serialize_playlists(playlists, genre="", platform="", sync=False):
+    """Playlist rows -> dicts matching the frontend's Playlist type.
+
+    With genre/platform set, `games` only holds the matching games,
+    while `game_count` stays the playlist's full size.
+    With sync=True, games that have no genres get them from Steam first.
+    """
+
+    def load_links():
+        return list(
+            PlaylistGame.objects.filter(playlist_id__in=[p.id for p in playlists])
+            .select_related("game")
+            .prefetch_related("game__external_ids", "game__genres")
+            .order_by("position")
+        )
+
+    links = load_links()
+
+    if sync and _fill_missing_genres(links):
+        links = load_links()  # reload so the new genres show up
+
+    genre = genre.strip().lower()
+    platform = platform.strip().lower()
+
+    platform_ids = None
+    if platform in ("windows", "mac", "linux"):
+        platform_ids = set(
+            Game.objects.filter(
+                id__in=[l.game_id for l in links],
+                platforms__slug=platform,  # <- adjust to your Game model
+            ).values_list("id", flat=True)
+        )
+
+    games_by_playlist = {}
+    totals = {}
+    for link in links:
+        totals[link.playlist_id] = totals.get(link.playlist_id, 0) + 1
+
+        if genre and genre not in {g.name.lower() for g in link.game.genres.all()}:
+            continue
+        if platform_ids is not None and link.game_id not in platform_ids:
+            continue
+
+        games_by_playlist.setdefault(link.playlist_id, []).append({
+            "id": link.game.id,
+            "title": link.game.title,
+            "steam_appid": _steam_id(link.game),
+            "cover_url": link.game.cover_image_url,
+            "genres": [g.name for g in link.game.genres.all()],
+            "position": link.position,
+            "note": getattr(link, "note", None),
+        })
+
+    results = []
+    for p in playlists:
+        results.append({
+            "id": p.id,
+            "title": p.title,
+            "description": p.description,
+            "visibility": p.visibility,
+            "owner": {
+                "id": p.user.id,
+                "username": p.user.username,
+                "nickname": getattr(p.user, "nickname", None),
+                "avatar_url": getattr(p.user, "avatar_url", None),
+            },
+            "game_count": totals.get(p.id, 0),
+            "like_count": 0,        # TODO: wire to your likes table
+            "liked_by_me": False,   # TODO
+            "games": games_by_playlist.get(p.id, []),
+            "created_at": p.created_at,
+            "updated_at": p.updated_at,
+        })
+    return results
+
 class CommunityPlaylistViewSet(GenericViewSet):
     """
-    GET /playlists/?search=<title>&user=<username>&limit=12&offset=0
-
-    Public, non-deleted playlists for the Community Playlists section.
+    GET /playlists/?search=&user=&genre=&platform=&sort=&limit=12&offset=0
+    GET /playlists/genres/
+    GET /playlists/<id>/
     """
 
-    permission_classes = [permissions.AllowAny]  # IsAuthenticated if Home is login-only
+    permission_classes = [permissions.AllowAny]
     pagination_class = PlaylistPagination
 
+    SORTS = {
+        "newest": "-id",
+        "oldest": "id",
+        "updated": "-updated_at",
+        "title": "title",
+    }
+
     def get_queryset(self):
-        queryset = (
-            Playlist.objects.filter(
-                deleted_at__isnull=True,
-                visibility="public",  # <- check this matches your model's value
-            )
-            .select_related("user")
-            .order_by("-id")
-        )
+        queryset = Playlist.objects.filter(
+            deleted_at__isnull=True,
+            visibility="public",
+        ).select_related("user")
 
         params = self.request.query_params
 
@@ -684,51 +833,61 @@ class CommunityPlaylistViewSet(GenericViewSet):
         if username:
             queryset = queryset.filter(user__username=username)
 
-        return queryset
+        # A playlist matches if at least one of its games has the genre.
+        genre = (params.get("genre") or "").strip()
+        if genre:
+            queryset = queryset.filter(
+                id__in=PlaylistGame.objects.filter(
+                    game__genres__name__iexact=genre
+                ).values("playlist_id")
+            )
+
+        platform = (params.get("platform") or "").strip().lower()
+        if platform in ("windows", "mac", "linux"):
+            queryset = queryset.filter(
+                id__in=PlaylistGame.objects.filter(
+                    game__platforms__slug=platform  # <- adjust to your Game model
+                ).values("playlist_id")
+            )
+
+        order = self.SORTS.get((params.get("sort") or "").strip().lower(), "-id")
+        return queryset.order_by(order, "-id")
 
     def list(self, request):
         page = self.paginate_queryset(self.get_queryset())
-
-        # One query for every game on this page, grouped by playlist.
-        links = (
-            PlaylistGame.objects.filter(playlist_id__in=[p.id for p in page])
-            .select_related("game")
-            .prefetch_related("game__external_ids", "game__genres")
-            .order_by("position")
+        params = request.query_params
+        return self.get_paginated_response(
+            _serialize_playlists(
+                page,
+                genre=params.get("genre") or "",
+                platform=params.get("platform") or "",
+            )
         )
 
-        games_by_playlist = {}
-        for link in links:
-            games_by_playlist.setdefault(link.playlist_id, []).append({
-                "id": link.game.id,
-                "title": link.game.title,
-                "steam_appid": _steam_id(link.game),
-                "cover_url": link.game.cover_image_url,
-                "genres": [g.name for g in link.game.genres.all()],
-                "position": link.position,
-                "note": getattr(link, "note", None),
-            })
+    @action(detail=False, methods=["get"])
+    def genres(self, request):
+        """Genres that actually exist in public playlists (for the filter dropdown)."""
+        names = (
+            PlaylistGame.objects.filter(
+                playlist__deleted_at__isnull=True,
+                playlist__visibility="public",
+                game__genres__isnull=False,
+            )
+            .values_list("game__genres__name", flat=True)
+            .distinct()
+            .order_by("game__genres__name")
+        )
+        return Response(list(names))
 
-        results = []
-        for p in page:
-            games = games_by_playlist.get(p.id, [])
-            results.append({
-                "id": p.id,
-                "title": p.title,
-                "description": p.description,
-                "visibility": p.visibility,
-                "owner": {
-                    "id": p.user.id,
-                    "username": p.user.username,
-                    "nickname": getattr(p.user, "nickname", None),
-                    "avatar_url": getattr(p.user, "avatar_url", None),
-                },
-                "game_count": len(games),
-                "like_count": 0,        # TODO: wire to your likes table
-                "liked_by_me": False,   # TODO
-                "games": games,
-                "created_at": p.created_at,
-                "updated_at": p.updated_at,
-            })
+    def retrieve(self, request, pk=None):
+        playlist = get_object_or_404(
+            Playlist.objects.select_related("user"),
+            pk=pk,
+            deleted_at__isnull=True,
+        )
 
-        return self.get_paginated_response(results)
+        is_owner = request.user.is_authenticated and playlist.user_id == request.user.id
+        if playlist.visibility == "private" and not is_owner:
+            raise NotFound("Playlist not found.")
+
+        return Response(_serialize_playlists([playlist], sync=True)[0])
