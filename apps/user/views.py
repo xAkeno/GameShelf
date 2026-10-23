@@ -15,6 +15,11 @@ from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
+from django.db.models import Max
+from apps.core.models import UserFavoriteGame
+from .serializers import UserFavoriteGameSerializer, AddFavoriteSerializer
+from apps.library.views import _get_or_create_game
+import requests
 
 from apps.core.models import Friendship, Notification, SecurityEvent
 from apps.user.serializers import can_view
@@ -108,7 +113,7 @@ def friends_queryset(owner, search=None):
     return queryset.order_by("-updated_at", "-id")
 
 
-# ─── Email Verification & Password Reset ──────────────────────────────────────
+# ─── Email Verification & Password Reset ────────────────────────────────      
 class EmailVerificationTokenGenerator(PasswordResetTokenGenerator):
     key_salt = "users.tokens.EmailVerificationTokenGenerator"
 
@@ -379,7 +384,84 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 context={"request": request}
             ).data,
         })
-        # ─── Friends & Unfriend ───────────────────────────────────────────────────
+    
+    @action(
+        detail=False,
+        methods=["get", "post", "delete"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="favorites",
+    )
+    def favorites(self, request):
+        me = request.user
+
+        if request.method == "GET":
+            favs = (
+                UserFavoriteGame.objects.filter(user=me)
+                .select_related("game")
+                .prefetch_related("game__external_ids", "game__genres")
+            )
+            return Response(
+                UserFavoriteGameSerializer(favs, many=True, context={"request": request}).data
+            )
+
+        if request.method == "POST":
+            serializer = AddFavoriteSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            app_id = serializer.validated_data["steam_app_id"]
+
+            try:
+                game = _get_or_create_game(app_id)
+            except requests.RequestException:
+                return Response(
+                    {"error": "Unable to fetch game details from Steam."},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+            if game is None:
+                return Response(
+                    {"error": f"Game not found on Steam (app id {app_id})."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            max_pos = UserFavoriteGame.objects.filter(user=me).aggregate(Max("position"))["position__max"] or 0
+            position = serializer.validated_data.get("position", max_pos + 1)
+
+            fav, created = UserFavoriteGame.objects.update_or_create(
+                user=me,
+                game=game,
+                defaults={"position": position},
+            )
+
+            # Re-fetch with prefetch annotations for the serializer
+            fav = (
+                UserFavoriteGame.objects.filter(pk=fav.pk)
+                .select_related("game")
+                .prefetch_related("game__external_ids", "game__genres")
+                .first()
+            )
+
+            return Response(
+                UserFavoriteGameSerializer(fav, context={"request": request}).data,
+                status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+            )
+
+        if request.method == "DELETE":
+            app_id = request.data.get("steam_app_id") or request.query_params.get("steam_app_id")
+            if not app_id:
+                return Response({"error": "steam_app_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+            deleted, _ = UserFavoriteGame.objects.filter(
+                user=me,
+                game__external_ids__source="steam",
+                game__external_ids__external_id=str(app_id),
+            ).delete()
+
+            if not deleted:
+                return Response({"error": "Favorite entry not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # ─── Friends & Unfriend ───────────────────────────────────────────────────
     @action(
         detail=False,
         methods=["get", "delete"],
@@ -476,105 +558,5 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 rows, 
                 many=True, 
                 context={"me": me, "request": request}
-            ).data,
-        })
-
-    @action(
-        detail=True,
-        methods=["post"],
-        permission_classes=[permissions.IsAuthenticated],
-        url_path="friend-requests/(?P<pk>\\d+)/accept",
-    )
-    def accept_friend_request(self, request, username=None, pk=None):
-        # Note: DRF maps pk from the custom url path
-        pass # Handled via standard viewset if routed, or keep separate endpoint logic below
-
-    # Alternatively, use detail=False for explicit ID actions:
-    @action(
-        detail=False,
-        methods=["post"],
-        permission_classes=[permissions.IsAuthenticated],
-        url_path=r"friend-requests/(?P<pk>\d+)/accept",
-    )
-    def accept_request_action(self, request, pk=None):
-        with transaction.atomic():
-            row = Friendship.objects.select_for_update().filter(pk=pk, friend=request.user, status=Status.PENDING).first()
-            if not row:
-                return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
-            accept_request(row, request.user)
-        return Response(FriendshipSerializer(row, context={"me": request.user}).data)
-
-    @action(
-        detail=False,
-        methods=["post"],
-        permission_classes=[permissions.IsAuthenticated],
-        url_path=r"friend-requests/(?P<pk>\d+)/decline",
-    )
-    def decline_request_action(self, request, pk=None):
-        row = Friendship.objects.filter(pk=pk, friend=request.user, status=Status.PENDING).first()
-        if not row:
-            return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
-        row.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-    @action(
-        detail=False,
-        methods=["post"],
-        permission_classes=[permissions.IsAuthenticated],
-        url_path=r"friend-requests/(?P<pk>\d+)/cancel",
-    )
-    def cancel_request_action(self, request, pk=None):
-        row = Friendship.objects.filter(pk=pk, user=request.user, status=Status.PENDING).first()
-        if not row:
-            return Response({"detail": "Request not found."}, status=status.HTTP_404_NOT_FOUND)
-        row.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-    # ─── Blocking ─────────────────────────────────────────────────────────────
-    @action(
-        detail=False,
-        methods=["get", "post", "delete"],
-        permission_classes=[permissions.IsAuthenticated],
-        url_path=r"blocks(?:/(?P<username>[\w.@+-]+))?",
-    )
-    def blocks(self, request, username=None):
-        me = request.user
-
-        if request.method == "DELETE":
-            other = find_user(username)
-            row = Friendship.objects.filter(user=me, friend=other, status=Status.BLOCKED).first() if other else None
-            if row is None:
-                return Response({"detail": "You haven't blocked this user."}, status=status.HTTP_404_NOT_FOUND)
-            row.delete()
-            return Response(status=status.HTTP_204_NO_CONTENT)
-
-        if request.method == "POST":
-            serializer = UsernameSerializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            target = find_user(serializer.validated_data["username"])
-
-            if target is None or target.pk == me.pk:
-                return Response({"detail": "Invalid user target."}, status=status.HTTP_400_BAD_REQUEST)
-
-            existing = get_pair(me, target)
-            if existing and existing.status == Status.BLOCKED and existing.user_id == me.id:
-                return Response(UserBriefSerializer(target).data)
-
-            with transaction.atomic():
-                Friendship.objects.filter(pair_filter(me, target)).delete()
-                row = Friendship.objects.create(user=me, friend=target, status=Status.BLOCKED)
-
-            return Response(UserBriefSerializer(target).data, status=status.HTTP_201_CREATED)
-
-        # GET Blocks List
-        rows = Friendship.objects.filter(user=me, status=Status.BLOCKED).select_related("friend").order_by("-updated_at")
-        blocked_users = [row.friend for row in rows]
-
-        return Response({
-            "count": len(blocked_users),
-            "results": UserBriefSerializer(
-                blocked_users, 
-                many=True, 
-                context={"request": request}
             ).data,
         })
