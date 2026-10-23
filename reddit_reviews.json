@@ -1,0 +1,12 @@
+{
+  "source": "reddit",
+  "kind": "reviews",
+  "summary": {
+    "score": null,
+    "label": "Community discussions",
+    "count": 0,
+    "url": "https://www.reddit.com/search/?q=Counter-Strike%202%20review"
+  },
+  "items": [],
+  "next_cursor": null
+}
