@@ -1,9 +1,5 @@
 from rest_framework import serializers
-
 from apps.core.models import Game, Playlist, PlaylistGame, UserGameList
-
-# If this import fails, use the explicit path:
-# from apps.core.models.library import UserGameList
 
 
 class UserGameListSerializer(serializers.ModelSerializer):
@@ -35,7 +31,6 @@ class UserGameListSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_steam_app_id(self, obj):
-        # Filter in Python so the prefetched external_ids are reused.
         ext = next(
             (e for e in obj.game.external_ids.all() if e.source == "steam"), None
         )
@@ -51,7 +46,7 @@ class UserGameListSerializer(serializers.ModelSerializer):
 
 
 class AddToListSerializer(serializers.Serializer):
-    """POST /list/  ->  add a Steam game (or change its status)."""
+    """POST /list/ -> add a Steam game (or change its status)."""
 
     steam_app_id = serializers.IntegerField(min_value=1)
     status = serializers.ChoiceField(
@@ -69,9 +64,7 @@ class UpdateListEntrySerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         started = attrs.get("started_at", getattr(self.instance, "started_at", None))
-        completed = attrs.get(
-            "completed_at", getattr(self.instance, "completed_at", None)
-        )
+        completed = attrs.get("completed_at", getattr(self.instance, "completed_at", None))
         if started and completed and completed < started:
             raise serializers.ValidationError(
                 "completed_at can't be earlier than started_at."
@@ -109,7 +102,7 @@ class CreatePlaylistSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         validated_data.pop("steam_app_ids", None)
-        games = validated_data.pop("games", [])  # passed in by the view via save(games=...)
+        games = validated_data.pop("games", [])
         playlist = Playlist.objects.create(
             user=self.context["request"].user, **validated_data
         )
@@ -117,6 +110,8 @@ class CreatePlaylistSerializer(serializers.ModelSerializer):
             [PlaylistGame(playlist=playlist, game=g, position=i) for i, g in enumerate(games)]
         )
         return playlist
+
+
 class PlaylistGameSearchSerializer(serializers.ModelSerializer):
     """Compact game result used by the playlist game's search bar."""
 
