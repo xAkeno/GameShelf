@@ -80,10 +80,11 @@ class AbsoluteMediaURLMixin:
 class UserBriefSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
     """Compact user profile representation for friends lists, search, suggestions, and blocks."""
     avatar_url = serializers.SerializerMethodField()
-
+    banner_url = serializers.SerializerMethodField()
+    
     class Meta:
         model = User
-        fields = ["id", "username", "nickname", "avatar_url", "bio"]
+        fields = ["id", "username", "nickname", "avatar_url", "bio", "banner_url"]
 
     def get_avatar_url(self, obj):
         if not obj.avatar_url:
@@ -98,6 +99,19 @@ class UserBriefSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
             return request.build_absolute_uri(obj.avatar_url)
             
         return obj.avatar_url
+    
+    def get_banner_url(self, obj):
+        if not obj.banner_url:
+            return None
+        
+        request = self.context.get("request")
+        if request and obj.banner_url.startswith(settings.MEDIA_URL):
+            return request.build_absolute_uri(obj.banner_url)
+        
+        if request and not obj.banner_url.startswith("http"):
+            return request.build_absolute_uri(obj.banner_url)
+            
+        return obj.banner_url
 
 
 class FriendshipSerializer(serializers.ModelSerializer):
