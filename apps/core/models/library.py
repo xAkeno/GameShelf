@@ -4,7 +4,6 @@ from django.db import models
 from django.db.models import F, Q
 
 from .base import SoftDeleteModel, TimeStampedModel
-
 USER = settings.AUTH_USER_MODEL
 
 

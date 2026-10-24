@@ -9,6 +9,7 @@ OUTPUT_FILE = BASE_DIR / "data" / "steam_games_reduced.json"
 
 KEEP_FIELDS = {
     "name",
+    "header_image",
     "release_date",
     "price",
     "windows",

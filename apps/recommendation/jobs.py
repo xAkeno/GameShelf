@@ -89,6 +89,39 @@ def _as_names(value):
 
     return []
 
+def _to_int(value) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _vote_count(metadata) -> int:
+    """Review count if the JSON has one (positive+negative, or recommendations)."""
+    votes = _to_int(metadata.get("positive")) + _to_int(metadata.get("negative"))
+    if votes:
+        return votes
+    recommendations = metadata.get("recommendations")
+    if isinstance(recommendations, dict):
+        recommendations = recommendations.get("total")
+    return _to_int(recommendations)
+
+
+def _platforms(metadata) -> list[str]:
+    """Works with {"platforms": {"windows": true}}, ["windows"], "windows,mac" or top-level windows: true."""
+    raw = metadata.get("platforms")
+    if isinstance(raw, dict):
+        enabled = {str(k).lower() for k, v in raw.items() if v is True}
+    elif isinstance(raw, list):
+        enabled = {str(x).lower() for x in raw}
+    elif isinstance(raw, str):
+        enabled = {x.strip().lower() for x in raw.split(",")}
+    else:
+        enabled = set()
+    if "macos" in enabled:
+        enabled.add("mac")
+    return [p for p in ("windows", "mac", "linux") if p in enabled or metadata.get(p) is True]
+
 
 def _load_steam_games():
     """Load game metadata directly from the reduced Steam JSON file."""
@@ -144,12 +177,21 @@ def _load_steam_games():
         games[appid] = {
             "appid": appid,
             "name": str(name),
+            "header_image": metadata.get("header_image"),
             "release_date": metadata.get("release_date"),
             "genres": genres,
             "categories": categories,
             "tags": tags,
             "description": str(description),
+            "platforms": _platforms(metadata),
+            "votes": _vote_count(metadata),
         }
+
+        platforms = [
+            platform
+            for platform in ("windows", "mac", "linux")
+            if metadata.get(platform) is True
+        ]
 
     if not games:
         raise ValueError("No valid games were found in the Steam JSON file.")
@@ -620,83 +662,73 @@ def _save_clusters(run, entity_type, result, names, member_ids, member_field, ex
     return result.k
 
 
-def build_clusters(k=10, **kwargs):
+def build_clusters(k=None, **kwargs):
     def work():
         games = _load_steam_games()
-        appids, documents = _build_documents(games)
+
+        appids, documents = [], []
+        for appid, game in games.items():
+            document = algorithms.kmeans_document(game["genres"], game["tags"])
+            if document:
+                appids.append(appid)
+                documents.append(document)
+        if not documents:
+            raise NotEnoughData("No games with genres or tags were found in the Steam JSON.")
 
         model = algorithms.build_tfidf(appids, documents)
         matrix = model.matrix
+        vocabulary = [str(term) for term in model.vectorizer.get_feature_names_out()]
+        idf = model.vectorizer.idf_
 
-        reduced = algorithms.reduce_for_clustering(
-            matrix,
-            dims=50,
-        )
+        reduced = algorithms.reduce_for_clustering(matrix, dims=50)
+        clustering = algorithms.cluster_points(reduced, k=k, min_points=6, seed=42)
+        centroids = algorithms.term_centroids(matrix, clustering.labels, clustering.k)
 
-        clustering = algorithms.cluster_points(
-            reduced,
-            k=k,
-            min_points=6,
-            seed=42,
-        )
-
-        cluster_labels = clustering.labels
-        distances = clustering.distances
-        coordinates = clustering.coords
-
-        clusters = {}
-
-        for index, appid in enumerate(appids):
-            cluster_id = int(cluster_labels[index])
-            game = games[appid]
-
-            if cluster_id not in clusters:
-                clusters[cluster_id] = {
-                    "id": cluster_id,
-                    "label": "",
-                    "size": 0,
-                    "games": [],
-                    "_genres": {},
-                }
-
-            cluster = clusters[cluster_id]
-            cluster["size"] += 1
-
-            # Use common genres to create a readable cluster label.
+        # token -> the name Steam uses (for readable cluster labels)
+        display = {}
+        for game in games.values():
             for genre in game["genres"]:
-                cluster["_genres"][genre] = (
-                    cluster["_genres"].get(genre, 0) + 1
-                )
+                display.setdefault(algorithms.term_token("genre", genre), genre)
+            for tag in game["tags"][: algorithms.MAX_TAGS_PER_GAME]:
+                display.setdefault(algorithms.term_token("tag", tag), tag)
 
-            cluster["games"].append({
-                "appid": appid,
-                "distance": round(float(distances[index]), 6),
-                "pca_x": round(float(coordinates[index][0]), 6),
-                "pca_y": round(float(coordinates[index][1]), 6),
+        clusters = []
+        for cluster_id in range(clustering.k):
+            member_rows = np.flatnonzero(clustering.labels == cluster_id)
+            if member_rows.size == 0:
+                continue
+            weights = centroids[cluster_id]
+            top = [i for i in np.argsort(-weights)[:3] if weights[i] > 0]
+            top_terms = [display.get(vocabulary[i], vocabulary[i]) for i in top]
+            clusters.append({
+                "id": cluster_id,
+                "label": " / ".join(top_terms) or f"Cluster {cluster_id + 1}",
+                "size": int(member_rows.size),
+                "top_terms": top_terms,
+                "centroid": {
+                    vocabulary[i]: round(float(weights[i]), 4)
+                    for i in np.flatnonzero(weights >= 0.02)
+                },
+                "games": [
+                    {
+                        "appid": appids[r],
+                        "distance": round(float(clustering.distances[r]), 6),
+                        "pca_x": round(float(clustering.coords[r][0]), 6),
+                        "pca_y": round(float(clustering.coords[r][1]), 6),
+                    }
+                    for r in member_rows
+                ],
             })
 
-        for cluster in clusters.values():
-            top_genres = sorted(
-                cluster.pop("_genres").items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:3]
-
-            cluster["label"] = (
-                " / ".join(genre for genre, _ in top_genres)
-                or f"Cluster {cluster['id']}"
-            )
-
         artifact = {
+            "version": 2,
             "source": "steam_games_reduced.json",
             "game_count": len(appids),
             "cluster_count": len(clusters),
-            "clusters": sorted(
-                clusters.values(),
-                key=lambda cluster: cluster["id"],
-            ),
+            "vocabulary": vocabulary,
+            "idf": [round(float(x), 6) for x in idf],
+            "clusters": clusters,
         }
-
         output_path = RECOMMENDATION_DIR / "game_clusters.json"
         _write_json_atomic(output_path, artifact)
 
@@ -704,6 +736,7 @@ def build_clusters(k=10, **kwargs):
             "json_games": len(games),
             "games_clustered": len(appids),
             "game_clusters": len(clusters),
+            "terms": len(vocabulary),
             "output": str(output_path),
         }
 

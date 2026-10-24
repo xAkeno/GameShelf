@@ -6,7 +6,6 @@ from django.db.models.functions import Greatest, Least
 from django.utils import timezone
 
 from .base import TimeStampedModel
-
 USER = settings.AUTH_USER_MODEL
 
 
@@ -154,3 +153,31 @@ class Notification(models.Model):
         db_table = "notifications"
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["user", "read_at"], name="notification_user_read_idx")]
+
+class UserPlatform(models.Model):
+    class PlatformType(models.TextChoices):
+        WINDOWS = "windows", "Windows"
+        MAC = "mac", "macOS"
+        LINUX = "linux", "Linux"
+
+    user = models.ForeignKey(
+        USER,
+        on_delete=models.CASCADE,
+        related_name="preferred_platforms",
+    )
+    platform = models.CharField(
+        max_length=20,
+        choices=PlatformType.choices,
+    )
+
+    class Meta:
+        db_table = "user_platforms"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "platform"],
+                name="uniq_user_platform",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.platform}"
