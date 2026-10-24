@@ -1,19 +1,20 @@
 import os
 import uuid
+from apps.core.models import UserFavoriteGame
 
 from django.conf import settings
 from django.core.files.storage import default_storage
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import Count, Q
+from django.db.models import Q
 from rest_framework import serializers
 
-from apps.core.models import Friendship, Rating, Review, UserGameList, Notification
+from apps.core.models import Friendship, Rating, Review, Notification
+# Library-specific logic is now cleanly decoupled and imported via service interface
+from apps.library.views import get_library_counts
 
 User = get_user_model()
-
-
 # ─── Helpers (privacy rules and counts for profiles) ──────────────────────────
 def are_friends(a, b) -> bool:
     if a is None or b is None or not a.is_authenticated:
@@ -45,15 +46,6 @@ def count_friends(user) -> int:
     )
 
 
-def library_counts(user) -> dict:
-    """{'playing': 3, 'completed': 10, ...} with every status present."""
-    counts = {status: 0 for status in UserGameList.Status.values}
-    rows = UserGameList.objects.filter(user=user).values("status").annotate(total=Count("id"))
-    for row in rows:
-        counts[row["status"]] = row["total"]
-    return counts
-
-
 def run_password_validators(password, user=None):
     try:
         validate_password(password, user=user)
@@ -81,47 +73,47 @@ class UserBriefSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
     """Compact user profile representation for friends lists, search, suggestions, and blocks."""
     avatar_url = serializers.SerializerMethodField()
     banner_url = serializers.SerializerMethodField()
+    favorites = serializers.SerializerMethodField()  # Added favorites field
     
     class Meta:
         model = User
-        fields = ["id", "username", "nickname", "avatar_url", "bio", "banner_url"]
+        fields = ["id", "username", "nickname", "avatar_url", "bio", "banner_url", "favorites"]
 
     def get_avatar_url(self, obj):
         if not obj.avatar_url:
             return None
-        
         request = self.context.get("request")
-        if request and obj.avatar_url.startswith(settings.MEDIA_URL):
+        if request and (obj.avatar_url.startswith(settings.MEDIA_URL) or not obj.avatar_url.startswith("http")):
             return request.build_absolute_uri(obj.avatar_url)
-        
-        # If media URL is stored relative without leading domain
-        if request and not obj.avatar_url.startswith("http"):
-            return request.build_absolute_uri(obj.avatar_url)
-            
         return obj.avatar_url
     
     def get_banner_url(self, obj):
         if not obj.banner_url:
             return None
-        
         request = self.context.get("request")
-        if request and obj.banner_url.startswith(settings.MEDIA_URL):
+        if request and (obj.banner_url.startswith(settings.MEDIA_URL) or not obj.banner_url.startswith("http")):
             return request.build_absolute_uri(obj.banner_url)
-        
-        if request and not obj.banner_url.startswith("http"):
-            return request.build_absolute_uri(obj.banner_url)
-            
         return obj.banner_url
+
+    def get_favorites(self, obj):
+        favs = (
+            UserFavoriteGame.objects.filter(user=obj)
+            .select_related("game")
+            .prefetch_related("game__external_ids", "game__genres")
+            .order_by("position")
+        )
+        return UserFavoriteGameSerializer(favs, many=True, context=self.context).data
 
 
 class FriendshipSerializer(serializers.ModelSerializer):
     """Represent a friendship relationship or pending request from the logged-in user's perspective."""
     user = serializers.SerializerMethodField()
     direction = serializers.SerializerMethodField()
+    favorites = serializers.SerializerMethodField()  # Renamed from get_favorites
 
     class Meta:
         model = Friendship
-        fields = ["id", "user", "status", "direction", "created_at", "updated_at"]
+        fields = ["id", "user", "status", "direction", "created_at", "updated_at", "favorites"]
 
     def get_user(self, obj):
         me = self.context.get("me")
@@ -135,30 +127,17 @@ class FriendshipSerializer(serializers.ModelSerializer):
         if not me or obj.status != Friendship.Status.PENDING:
             return None
         return "outgoing" if obj.user_id == me.id else "incoming"
-
-
-class FriendshipSerializer(serializers.ModelSerializer):
-    """Represent a friendship relationship or pending request from the logged-in user's perspective."""
-    user = serializers.SerializerMethodField()
-    direction = serializers.SerializerMethodField()
-
-    class Meta:
-        model = Friendship
-        fields = ["id", "user", "status", "direction", "created_at", "updated_at"]
-
-    def get_user(self, obj):
+    
+    def get_favorites(self, obj):
         me = self.context.get("me")
-        if not me:
-            return UserBriefSerializer(obj.friend).data
-        other = obj.friend if obj.user_id == me.id else obj.user
-        return UserBriefSerializer(other, context=self.context).data
-
-    def get_direction(self, obj):
-        me = self.context.get("me")
-        if not me or obj.status != Friendship.Status.PENDING:
-            return None
-        return "outgoing" if obj.user_id == me.id else "incoming"
-
+        other = obj.friend if not me or obj.user_id == me.id else obj.user
+        favs = (
+            UserFavoriteGame.objects.filter(user=other)  # Filter by the correct user object
+            .select_related("game")
+            .prefetch_related("game__external_ids", "game__genres")
+            .order_by("position")
+        )
+        return UserFavoriteGameSerializer(favs, many=True, context=self.context).data
 
 # ─── Register / Login / Password ──────────────────────────────────────────────
 class RegisterSerializer(serializers.ModelSerializer):
@@ -283,6 +262,7 @@ class UserMeSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
             instance.save(update_fields=["avatar_url", "banner_url"])
 
         return instance
+    
 
 
 class UserProfileSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
@@ -293,12 +273,13 @@ class UserProfileSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
     library = serializers.SerializerMethodField()
     ratings_count = serializers.SerializerMethodField()
     reviews_count = serializers.SerializerMethodField()
+    favorites = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             "id", "username", "nickname", "bio", "avatar_url", "banner_url", "joined",
-            "friend_count", "library", "ratings_count", "reviews_count",
+            "friend_count", "library", "ratings_count", "reviews_count","favorites"
         ]
 
     def _viewer(self):
@@ -312,7 +293,7 @@ class UserProfileSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
 
     def get_library(self, obj):
         if can_view(obj, self._viewer(), obj.library_visibility):
-            return library_counts(obj)
+            return get_library_counts(obj)
         return None
 
     def get_ratings_count(self, obj) -> int:
@@ -322,6 +303,15 @@ class UserProfileSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
         return Review.objects.filter(
             user=obj, deleted_at__isnull=True, status=Review.Status.PUBLISHED
         ).count()
+    
+    def get_favorites(self, obj):
+        favs = (
+            UserFavoriteGame.objects.filter(user=obj)
+            .select_related("game")
+            .prefetch_related("game__external_ids", "game__genres")
+            .order_by("position")
+        )
+        return UserFavoriteGameSerializer(favs, many=True, context=self.context).data
 
 
 # ─── Password Reset & Utility Serializers ─────────────────────────────────────
@@ -350,3 +340,30 @@ class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification
         fields = ["id", "type", "payload", "read_at", "created_at"]
+# faafaf
+
+class UserFavoriteGameSerializer(serializers.ModelSerializer):
+    game_id = serializers.IntegerField(source="game.id", read_only=True)
+    steam_app_id = serializers.SerializerMethodField()
+    title = serializers.CharField(source="game.title", read_only=True)
+    cover_image_url = serializers.CharField(
+        source="game.cover_image_url", read_only=True, allow_null=True
+    )
+    genres = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UserFavoriteGame
+        fields = ["id", "game_id", "steam_app_id", "title", "cover_image_url", "genres", "position"]
+        read_only_fields = fields
+
+    def get_steam_app_id(self, obj):
+        ext = next((e for e in obj.game.external_ids.all() if e.source == "steam"), None)
+        return int(ext.external_id) if ext and ext.external_id.isdigit() else None
+
+    def get_genres(self, obj):
+        return [genre.name for genre in obj.game.genres.all()]
+
+class AddFavoriteSerializer(serializers.Serializer):
+    """Payload to add a favorite game by Steam app ID."""
+    steam_app_id = serializers.IntegerField(min_value=1)
+    position = serializers.IntegerField(min_value=1, required=False)
