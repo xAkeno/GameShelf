@@ -277,16 +277,54 @@ def _distinct(points: np.ndarray) -> int:
     return len(np.unique(points.round(8), axis=0))
 
 
-def choose_k(points: np.ndarray, k_min: int = 2, k_max: int = 10, seed: int = 42) -> int:
-    """The number of clusters with the best silhouette score (how well separated they are)."""
-    best_k, best_score = k_min, -1.0
-    for k in range(k_min, min(k_max, points.shape[0] - 1, _distinct(points)) + 1):
-        labels = KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(points)
-        if len(set(labels)) < 2:
+def choose_k(points, k_min=2, k_max=10, seed=42):
+    import numpy as np
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    count = points.shape[0]
+
+    if count < 3:
+        raise NotEnoughData(
+            f"Need at least 3 items to choose clusters; found {count}."
+        )
+
+    # Evaluate possible cluster counts on a sample, not the full dataset.
+    sample_size = min(5000, count)
+    rng = np.random.default_rng(seed)
+
+    if count > sample_size:
+        indices = rng.choice(count, size=sample_size, replace=False)
+        sample = points[indices]
+    else:
+        sample = points
+
+    distinct_count = np.unique(sample, axis=0).shape[0]
+    upper_k = min(k_max, distinct_count - 1)
+
+    if upper_k < k_min:
+        return min(2, distinct_count)
+
+    best_k = k_min
+    best_score = -1.0
+
+    for k in range(k_min, upper_k + 1):
+        model = KMeans(
+            n_clusters=k,
+            random_state=seed,
+            n_init=10,
+        )
+        labels = model.fit_predict(sample)
+
+        if len(np.unique(labels)) < 2:
             continue
-        score = silhouette_score(points, labels)
+
+        score = silhouette_score(sample, labels)
+
         if score > best_score:
-            best_k, best_score = k, score
+            best_score = score
+            best_k = k
+
     return best_k
 
 
@@ -305,7 +343,7 @@ def cluster_points(points: np.ndarray, k: int | None = None, min_points: int = 6
     distinct = _distinct(points)
     if distinct < 2:
         raise NotEnoughData("All items look identical, so there is nothing to separate into groups.")
-    k = max(2, min(k or choose_k(points, seed=seed), n - 1, distinct))
+    k = max(2, min(k or default_k(n), n - 1, distinct))
     km = KMeans(n_clusters=k, n_init=10, random_state=seed).fit(points)
     distances = np.linalg.norm(points - km.cluster_centers_[km.labels_], axis=1)
     return ClusterResult(k, km.labels_, distances, km.cluster_centers_, pca_coordinates(points, seed))
@@ -330,6 +368,129 @@ def label_clusters(matrix, labels, feature_names, prefixes=("genre_", "tag_"), t
         best = np.argsort(-strength)[:top_terms]
         out[cluster] = [_pretty(str(names[i])) for i in best if mean[i] > 0]
     return out
+
+# ─── K-Means taste recommender ────────────────────────────────────────────────
+MAX_TAGS_PER_GAME = 10   # Steam lists dozens of tags per game; the top ones describe it
+GENRE_WEIGHT = 1.0
+TAG_WEIGHT = 1.0
+LIKED_WEIGHT = 1.5       # games you like say more than a ticked box
+CLUSTER_BLEND = 0.25     # share of the score that comes from the cluster match
+QUALITY_WEIGHT = 0.15    # small push towards games many players reviewed (only if the JSON has votes)
+
+
+def default_k(n_items: int) -> int:
+    """Number of groups for a catalogue of n_items games (about 6 for tiny sets, 40 for huge ones)."""
+    return int(np.clip(round(np.sqrt(n_items) / 4), 6, 40))
+
+
+def term_token(kind: str, name: str) -> str:
+    """('genre', 'Role-Playing') -> 'genre_role_playing'"""
+    return _token(kind, name)
+
+
+def kmeans_document(genres, tags) -> str:
+    """Genres and top tags only (no description words), so the vocabulary is a few hundred
+    terms the player can actually pick as interests."""
+    return build_game_document(genres, list(tags)[:MAX_TAGS_PER_GAME], "").strip()
+
+
+def term_matrix(documents, index: dict[str, int], idf: np.ndarray) -> sparse.csr_matrix:
+    """TF-IDF rows computed the same way build_tfidf does (sublinear tf, idf, L2 norm).
+    `documents` is a list of token lists."""
+    rows, cols, vals = [], [], []
+    for row, tokens in enumerate(documents):
+        counts: dict[int, int] = {}
+        for token in tokens:
+            col = index.get(token)
+            if col is not None:
+                counts[col] = counts.get(col, 0) + 1
+        for col, count in counts.items():
+            rows.append(row)
+            cols.append(col)
+            vals.append((1.0 + np.log(count)) * idf[col])
+    matrix = sparse.csr_matrix(
+        (np.array(vals, dtype=float), (np.array(rows, dtype=int), np.array(cols, dtype=int))),
+        shape=(len(documents), len(index)),
+    )
+    norms = np.sqrt(np.asarray(matrix.multiply(matrix).sum(axis=1)).ravel())
+    norms[norms == 0] = 1.0
+    return sparse.diags(1.0 / norms).dot(matrix).tocsr()
+
+
+def term_centroids(matrix, labels, k: int) -> np.ndarray:
+    """Cluster centres in term space (k x terms, L2-normalised), so an interest vector can be
+    compared with them directly."""
+    labels = np.asarray(labels)
+    members = sparse.csr_matrix(
+        (np.ones(len(labels)), (labels, np.arange(len(labels)))), shape=(k, len(labels))
+    )
+    centroids = (members @ matrix).toarray()
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    return centroids / norms
+
+
+def interest_vector(index, idf, genres, tags, liked_vectors=None):
+    """One vector for everything the player picked: genres, tags and liked games.
+    liked_vectors is the (liked games x terms) rows of the game matrix, or None."""
+    parts = []
+    for weight, kind, names in ((GENRE_WEIGHT, "genre", genres), (TAG_WEIGHT, "tag", tags)):
+        if names:
+            tokens = [_token(kind, name) for name in names]
+            vec = term_matrix([tokens], index, idf).toarray().ravel()
+            if vec.any():
+                parts.append(weight * vec)
+    if liked_vectors is not None and liked_vectors.shape[0] > 0:
+        mean = np.asarray(liked_vectors.mean(axis=0)).ravel()
+        norm = np.linalg.norm(mean)
+        if norm > 0:
+            parts.append(LIKED_WEIGHT * mean / norm)
+    if not parts:
+        return None
+    total = np.sum(parts, axis=0)
+    norm = np.linalg.norm(total)
+    return total / norm if norm > 0 else None
+
+
+@dataclass
+class TasteIndex:
+    appids: list[int]
+    row_of: dict[int, int]
+    labels: np.ndarray            # cluster id of every game
+    matrix: sparse.csr_matrix     # game x term TF-IDF rows
+    centroids: np.ndarray         # cluster x term
+    cluster_names: dict[int, str]
+    index: dict[str, int]
+    idf: np.ndarray
+    quality: np.ndarray           # 0..1 per game
+    platform_rows: dict[str, np.ndarray]
+
+
+def rank_by_interest(matrix, labels, centroids, interest, allowed, quality, limit=20, first_clusters=3):
+    """Finds the clusters closest to the interest vector, then ranks their games.
+    If those clusters don't hold enough allowed games, it widens to more clusters.
+    Returns [(row, score, game_similarity), ...]."""
+    cluster_sims = centroids @ interest
+    order = np.argsort(-cluster_sims)
+    total = len(order)
+    ranked = []
+    for take in sorted({min(first_clusters, total), min(first_clusters * 2, total), total}):
+        chosen = [c for c in order[:take] if cluster_sims[c] > 0]
+        rows = np.flatnonzero(np.isin(labels, chosen) & allowed)
+        if rows.size == 0:
+            continue
+        game_sims = np.asarray(matrix[rows] @ interest).ravel()
+        keep = game_sims > 0
+        rows, game_sims = rows[keep], game_sims[keep]
+        if rows.size == 0:
+            continue
+        fit = (1 - CLUSTER_BLEND) * game_sims + CLUSTER_BLEND * cluster_sims[labels[rows]]
+        score = (1 - QUALITY_WEIGHT) * fit + QUALITY_WEIGHT * quality[rows]
+        top = np.argsort(-score)[:limit]
+        ranked = [(int(rows[i]), float(score[i]), float(game_sims[i])) for i in top]
+        if len(ranked) >= limit:
+            break
+    return ranked
 
 
 def taste_matrix(values: dict[tuple[int, int], float], game_genres: dict[int, list[str]], min_interactions: int = 3):

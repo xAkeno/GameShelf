@@ -48,6 +48,10 @@ INSTALLED_APPS = [
     "apps.analytics",
     "apps.moderation",
     "apps.social",
+<<<<<<< HEAD
+=======
+    'django_extensions'
+>>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b
 ]
 
 STEAM_API_KEY = config("STEAM_API_KEY")

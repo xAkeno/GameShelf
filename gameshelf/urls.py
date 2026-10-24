@@ -14,22 +14,43 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
+
+"""
+URL configuration for gameshelf project.
+"""
 from django.contrib import admin
 from django.urls import include, path
 from django.conf import settings
 from django.conf.urls.static import static
 
 urlpatterns = [
+<<<<<<< HEAD
     path('admin/', admin.site.urls),
+=======
+    path("admin/", admin.site.urls),
+
+>>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b
     path("api/v1/", include("apps.user.urls")),
     path("api/v1/games/", include("apps.games.urls")),
     path("api/v1/list/", include("apps.library.urls")),
     path("api/v1/reviews/", include("apps.reviews.urls")),
     path("api/v1/moderation/", include("apps.moderation.urls")),
     path("api/v1/social/", include("apps.social.urls")),
+<<<<<<< HEAD
 ]
+=======
+
+    # Recommendation endpoints
+    path("api/v1/", include("apps.recommendation.urls")),
+]
+
+>>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b
 if settings.DEBUG:
     urlpatterns += static(
         settings.MEDIA_URL,
         document_root=settings.MEDIA_ROOT,
+<<<<<<< HEAD
     )
+=======
+    )
+>>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b
