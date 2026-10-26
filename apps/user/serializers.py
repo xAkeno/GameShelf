@@ -10,8 +10,10 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from rest_framework import serializers
 
+
 from apps.core.models import Friendship, Rating, Review, Notification
 # Library-specific logic is now cleanly decoupled and imported via service interface
+from apps.core.models.users import UserAchievement
 from apps.library.views import get_library_counts
 
 User = get_user_model()
@@ -231,7 +233,7 @@ class UserMeSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
             "id", "username", "email", "email_verified", "role",
             "nickname", "bio", "avatar_url", "banner_url",
             "library_visibility", "friends_visibility", "created_at",
-            "avatar_file", "banner_file",
+            "avatar_file", "banner_file","pronouns"
         ]
         read_only_fields = ["id", "username", "email", "role"]
 
@@ -279,7 +281,7 @@ class UserProfileSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
         model = User
         fields = [
             "id", "username", "nickname", "bio", "avatar_url", "banner_url", "joined",
-            "friend_count", "library", "ratings_count", "reviews_count","favorites"
+            "friend_count", "library", "ratings_count", "reviews_count","favorites", "pronouns"
         ]
 
     def _viewer(self):
@@ -367,3 +369,47 @@ class AddFavoriteSerializer(serializers.Serializer):
     """Payload to add a favorite game by Steam app ID."""
     steam_app_id = serializers.IntegerField(min_value=1)
     position = serializers.IntegerField(min_value=1, required=False)
+
+class UserSerializer(serializers.ModelSerializer):
+    created_at = serializers.DateTimeField(source="date_joined", read_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            "id",
+            "username",
+            "email",
+            "nickname",
+            "bio",
+            "avatar_url",
+            "banner_url",
+            "age",
+            "gender",
+            "role",
+            "pronouns",
+            "library_visibility",
+            "friends_visibility",
+            "created_at",
+        ]
+        read_only_fields = ["id", "username", "email", "created_at", "role"]
+
+
+class UserAchievementSerializer(serializers.ModelSerializer):
+    game_title = serializers.CharField(source="game.title", read_only=True)
+    game_id = serializers.IntegerField(source="game.id", read_only=True)
+
+    class Meta:
+        model = UserAchievement
+        fields = [
+            "id",
+            "game_id",
+            "game_title",
+            "achievement_api_name",
+            "title",
+            "description",
+            "icon_url",
+            "achieved",
+            "unlock_time",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "game_id", "game_title", "updated_at"]

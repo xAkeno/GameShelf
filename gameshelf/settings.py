@@ -5,7 +5,11 @@ Django settings for gameshelf project.
 import os
 from pathlib import Path
 from decouple import config
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
+
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+]
 
 # ─── 1. CORE PATHS ───────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -48,11 +52,9 @@ INSTALLED_APPS = [
     "apps.analytics",
     "apps.moderation",
     "apps.social",
-<<<<<<< HEAD
-=======
-    'django_extensions'
->>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b
-]
+
+    'django_extensions']
+
 
 STEAM_API_KEY = config("STEAM_API_KEY")
 
@@ -164,6 +166,8 @@ REST_FRAMEWORK = {
         "friend_request": "20/hour",
     },
 }
+
+
 
 
 # ─── 13. EMAIL & FRONTEND URLS ────────────────────────────────────────────────

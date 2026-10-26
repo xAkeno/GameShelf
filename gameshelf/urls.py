@@ -24,33 +24,22 @@ from django.conf import settings
 from django.conf.urls.static import static
 
 urlpatterns = [
-<<<<<<< HEAD
-    path('admin/', admin.site.urls),
-=======
-    path("admin/", admin.site.urls),
 
->>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b
+    path("admin/", admin.site.urls),
     path("api/v1/", include("apps.user.urls")),
     path("api/v1/games/", include("apps.games.urls")),
     path("api/v1/list/", include("apps.library.urls")),
     path("api/v1/reviews/", include("apps.reviews.urls")),
     path("api/v1/moderation/", include("apps.moderation.urls")),
     path("api/v1/social/", include("apps.social.urls")),
-<<<<<<< HEAD
-]
-=======
 
     # Recommendation endpoints
     path("api/v1/", include("apps.recommendation.urls")),
 ]
 
->>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b
+
 if settings.DEBUG:
     urlpatterns += static(
         settings.MEDIA_URL,
         document_root=settings.MEDIA_ROOT,
-<<<<<<< HEAD
     )
-=======
-    )
->>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b

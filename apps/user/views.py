@@ -17,9 +17,12 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from django.db.models import Max
 from apps.core.models import UserFavoriteGame
-from .serializers import UserFavoriteGameSerializer, AddFavoriteSerializer
+from apps.core.models.users import UserAchievement
+from .serializers import UserAchievementSerializer, UserFavoriteGameSerializer, AddFavoriteSerializer
 from apps.library.views import _get_or_create_game
 import requests
+from rest_framework.decorators import action, permission_classes
+from apps.core.permissions import IsModeratorOrAdmin, IsAdminUserRole
 
 from apps.core.models import Friendship, Notification, SecurityEvent
 from apps.user.serializers import can_view
@@ -460,6 +463,12 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 return Response({"error": "Favorite entry not found."}, status=status.HTTP_404_NOT_FOUND)
 
             return Response(status=status.HTTP_204_NO_CONTENT)
+        
+    @action(detail=True, methods=["post"], permission_classes=[IsModeratorOrAdmin])
+
+    def sanction(self, request, pk=None):
+        # Only moderators or admins can issue sanctions
+        pass
 
     # ─── Friends & Unfriend ───────────────────────────────────────────────────
     @action(
@@ -560,3 +569,17 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 context={"me": me, "request": request}
             ).data,
         })
+class UserAchievementViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = UserAchievementSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        username = self.kwargs.get("username")
+        if username:
+            user = get_object_or_404(User, username=username)
+            return UserAchievement.objects.filter(user=user).select_related("game")
+        
+        # If no username provided in URL, fallback to current authenticated user
+        if self.request.user.is_authenticated:
+            return UserAchievement.objects.filter(user=self.request.user).select_related("game")
+        return UserAchievement.objects.none()
