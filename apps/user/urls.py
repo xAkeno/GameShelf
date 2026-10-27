@@ -9,5 +9,6 @@ router.register("auth", views.AuthViewSet, basename="auth")
 router.register("users", views.UserViewSet, basename="user")
 
 urlpatterns = [
+    path("users/import-steam/", views.ImportSteamLibraryView.as_view(), name="import-steam"),
     path("", include(router.urls)),
 ]
