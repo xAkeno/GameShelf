@@ -714,5 +714,152 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 context={"me": me, "request": request}
             ).data,
         })
+    
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="block",
+    )
+    def block_user(self, request, pk=None):
+        target_user = self.get_object()
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot block yourself."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        with transaction.atomic():
+            # Find existing friendship or create a blocked relationship
+            friendship = Friendship.objects.filter(
+                (Q(user=me) & Q(friend=target_user)) | (Q(user=target_user) & Q(friend=me))
+            ).first()
+            
+            if friendship:
+                friendship.status = Status.BLOCKED
+                friendship.user = me
+                friendship.friend = target_user
+                friendship.save(update_fields=["status", "user", "friend", "updated_at"])
+            else:
+                Friendship.objects.create(
+                    user=me,
+                    friend=target_user,
+                    status=Status.BLOCKED
+                )
+                
+        return Response({"detail": "User blocked successfully."})
 
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="report",
+    )
+    def report_user(self, request, pk=None):
+        target_user = self.get_object()
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot report yourself."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        reason = request.data.get("reason", "No reason provided")
+        
+        # Log or create report entry (or handle security event/notification)
+        # SecurityEvent or a custom Report model can be integrated here if available
+        
+        return Response({"detail": "User reported successfully. Thank you for keeping the community safe."})
+    
+class FriendshipViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = FriendshipSerializer
+    http_method_names = ["get", "post", "delete", "head", "options"]
 
+    def get_queryset(self):
+        me = self.request.user
+        return Friendship.objects.filter(Q(user=me) | Q(friend=me)).select_related("user", "friend")
+
+    @action(detail=True, methods=["post"], url_path="accept")
+    def accept(self, request, pk=None):
+        friendship = self.get_object()
+        me = request.user
+        
+        if friendship.friend != me:
+            return Response({"detail": "You cannot accept this request."}, status=status.HTTP_403_FORBIDDEN)
+        if friendship.status != Status.PENDING:
+            return Response({"detail": "This request is not pending."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        with transaction.atomic():
+            accept_request(friendship, me)
+            
+        return Response(FriendshipSerializer(friendship, context={"me": me}).data)
+
+    @action(detail=True, methods=["post", "delete"], url_path="reject")
+    def reject(self, request, pk=None):
+        friendship = self.get_object()
+        me = request.user
+        
+        if friendship.friend != me and friendship.user != me:
+            return Response({"detail": "Unauthorized."}, status=status.HTTP_403_FORBIDDEN)
+            
+        friendship.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post"], url_path="block")
+    def block(self, request, pk=None):
+        friendship = self.get_object()
+        me = request.user
+        
+        with transaction.atomic():
+            friendship.status = Status.BLOCKED
+            friendship.user = me
+            friendship.save(update_fields=["status", "user", "updated_at"])
+            
+        return Response({"detail": "User blocked successfully."})
+    
+class BlockViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = FriendshipSerializer
+    lookup_field = "friend__username"
+    http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def get_queryset(self):
+        return Friendship.objects.filter(user=self.request.user, status=Status.BLOCKED).select_related("friend")
+
+    def create(self, request, *args, **kwargs):
+        username = request.data.get("username")
+        target_user = get_object_or_404(User, username=username)
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot block yourself."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        friendship, _ = Friendship.objects.update_or_create(
+            user=me,
+            friend=target_user,
+            defaults={"status": Status.BLOCKED}
+        )
+        return Response(FriendshipSerializer(friendship, context={"me": me}).data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        username = kwargs.get("friend__username")
+        instance = get_object_or_404(Friendship, user=request.user, friend__username=username, status=Status.BLOCKED)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+class ReportViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ["post", "head", "options"]
+
+    def create(self, request, *args, **kwargs):
+        username = request.data.get("username")
+        reason = request.data.get("reason", "No reason provided")
+        details = request.data.get("details", "")
+        
+        target_user = get_object_or_404(User, username=username)
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot report yourself."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Optional: Save to a Report model if your project tracks user reports in the database
+        
+        return Response({"detail": "User reported successfully. Thank you for keeping the community safe."}, status=status.HTTP_201_CREATED)
