@@ -312,10 +312,24 @@ class Interactions:
 
 
 def load_interactions() -> Interactions:
+    """Ratings, likes and list statuses of active users, one value per (user, game).
+    A rating wins over a like, a like over a status (see algorithms.interaction_value)."""
     data = Interactions()
-    data.ratings = {(u, g): s for u, g, s in Rating.objects.values_list("user_id", "game_id", "score")}
-    data.likes = set(GameLike.objects.values_list("user_id", "game_id"))
-    statuses = {(u, g): s for u, g, s in UserGameList.objects.values_list("user_id", "game_id", "status")}
+    data.ratings = {
+        (u, g): s
+        for u, g, s in Rating.objects.filter(
+            user__is_active=True, score__gte=1, score__lte=10
+        ).values_list("user_id", "game_id", "score")
+    }
+    data.likes = set(
+        GameLike.objects.filter(user__is_active=True).values_list("user_id", "game_id")
+    )
+    statuses = {
+        (u, g): s
+        for u, g, s in UserGameList.objects.filter(user__is_active=True).values_list(
+            "user_id", "game_id", "status"
+        )
+    }
 
     for key in set(data.ratings) | data.likes | set(statuses):
         value = algorithms.interaction_value(data.ratings.get(key), key in data.likes, statuses.get(key))
@@ -590,6 +604,7 @@ def _explain(user_id, reason_game_id, data: Interactions, titles: dict[int, str]
 def build_recommendations(
     factors: int = 20, top_n: int = 20, min_users: int = 5, min_items: int = 5
 ) -> ModelRun:
+    """"Players Like You": collaborative filtering over every active player's interactions."""
     def work(run):
         data = load_interactions()
         triples = [(u, g, v) for (u, g), v in data.values.items()]
@@ -619,17 +634,20 @@ def build_recommendations(
                     )
                 )
         UserRecommendation.objects.bulk_create(rows, batch_size=1000)
+        all_users = {u for u, _ in data.values}
         return {
             "users": len(model.user_ids),
+            "users_without_enough_activity": len(all_users) - len(model.user_ids),
+            "users_with_recommendations": len(recs),
             "games": len(model.game_ids),
             "interactions": len(triples),
             "recommendations": len(rows),
-            "factors": min(factors, min(len(model.user_ids), len(model.game_ids)) - 1),
+            "factors": model.factors,
             "train_rmse": round(model.train_rmse, 3),
         }
 
     params = {"factors": factors, "top_n": top_n, "min_users": min_users, "min_items": min_items}
-    return _run_job("svd", "v1", params, work)
+    return _run_job("svd", "v2", params, work)
 
 
 # ─── 4. K-Means -> clusters + cluster_members ─────────────────────────────────

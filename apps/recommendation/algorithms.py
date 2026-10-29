@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-
+from collections import Counter
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import svds
@@ -143,14 +143,21 @@ def top_similar(matrix: sparse.csr_matrix, k: int = 20, min_score: float = 0.0, 
 
 
 # ─── 3. SVD matrix factorization ──────────────────────────────────────────────
+SVD_DAMPING = 5.0           # a user's baseline counts as this many "average" ratings (shrinks light users)
+MIN_USER_INTERACTIONS = 2   # a user with one interaction says nothing about taste
+MIN_PREDICTED_GAIN = 0.05   # only recommend games predicted above the user's own baseline
+DENSE_SVD_LIMIT = 64        # tiny matrices use an exact dense SVD (deterministic, no ARPACK quirks)
+
+
 @dataclass
 class SvdModel:
     user_ids: list[int]
     game_ids: list[int]
-    user_means: np.ndarray  # each user's average value (their personal "baseline")
+    user_means: np.ndarray  # each user's damped average value (their personal "baseline")
     user_factors: np.ndarray  # U * sigma, shape (users, k)
     item_factors: np.ndarray  # V^T, shape (k, games)
     train_rmse: float
+    factors: int = 0  # k actually used
 
 
 @dataclass
@@ -160,43 +167,101 @@ class Recommendation:
     reason_game_id: int | None  # the game the user liked that this one is closest to
 
 
-def fit_svd(interactions, factors: int = 20, min_users: int = 5, min_items: int = 5) -> SvdModel:
+def fit_svd(
+    interactions,
+    factors: int = 20,
+    min_users: int = 5,
+    min_items: int = 5,
+    min_user_interactions: int = MIN_USER_INTERACTIONS,
+    damping: float = SVD_DAMPING,
+) -> SvdModel:
     """interactions: [(user_id, game_id, value 1-10), ...].
 
-    Each user's values are centered on their own average (a harsh rater's 6 and a generous
-    rater's 9 mean the same), then the user x game matrix is factorised with a truncated SVD.
-    The hidden factors are taste patterns; multiplying them back fills in the empty cells.
+    Invalid values are ignored and each (user, game) pair counts once (the caller has already
+    applied rating > like > status). Each user's values are centered on their own damped
+    average, so a harsh rater's 6 and a generous rater's 9 mean the same, and a user with only
+    a couple of entries is centered close to the site average instead of on their own few
+    values. The user x game matrix is then factorised with a truncated SVD; the hidden
+    factors are taste patterns shared across users.
     """
-    if not interactions:
+    pairs: dict[tuple[int, int], float] = {}
+    for user_id, game_id, value in interactions:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(value) or not 1.0 <= value <= 10.0:
+            continue
+        pairs[(user_id, game_id)] = value
+    if not pairs:
         raise NotEnoughData("No ratings, likes or list entries to learn from yet.")
-    user_ids = sorted({u for u, _, _ in interactions})
-    game_ids = sorted({g for _, g, _ in interactions})
+
+    per_user = Counter(u for u, _ in pairs)
+    pairs = {k: v for k, v in pairs.items() if per_user[k[0]] >= min_user_interactions}
+
+    user_ids = sorted({u for u, _ in pairs})
+    game_ids = sorted({g for _, g in pairs})
     if len(user_ids) < min_users or len(game_ids) < min_items:
         raise NotEnoughData(
-            f"Need at least {min_users} users and {min_items} games with activity; "
+            f"Need at least {min_users} users and {min_items} games with enough activity; "
             f"found {len(user_ids)} users and {len(game_ids)} games."
         )
     u_index = {u: i for i, u in enumerate(user_ids)}
     g_index = {g: i for i, g in enumerate(game_ids)}
-    rows = np.array([u_index[u] for u, _, _ in interactions])
-    cols = np.array([g_index[g] for _, g, _ in interactions])
-    vals = np.array([v for _, _, v in interactions], dtype=float)
+    rows = np.array([u_index[u] for u, _ in pairs])
+    cols = np.array([g_index[g] for _, g in pairs])
+    vals = np.array(list(pairs.values()), dtype=float)
 
-    means = np.bincount(rows, weights=vals, minlength=len(user_ids)) / np.bincount(
-        rows, minlength=len(user_ids)
-    )
+    sums = np.bincount(rows, weights=vals, minlength=len(user_ids))
+    counts = np.bincount(rows, minlength=len(user_ids))
+    means = (sums + damping * vals.mean()) / (counts + damping)
     centered = vals - means[rows]
     matrix = sparse.csr_matrix((centered, (rows, cols)), shape=(len(user_ids), len(game_ids)))
+    print("DEBUG user_ids:", user_ids)
+    print("DEBUG game_ids:", game_ids)
+    print("DEBUG means:", np.round(means, 3))
+    print("DEBUG centered matrix:")
+    print(np.round(matrix.toarray(), 3))
 
-    k = min(factors, min(matrix.shape) - 1)
-    if k < 1 or not np.any(centered):
+    small = min(matrix.shape)
+    if small < 2 or not np.any(centered):
         raise NotEnoughData("Ratings are too uniform to learn anyone's taste from.")
-    u, s, vt = svds(matrix, k=k)
+    # never keep so many factors that the model just memorises the observed cells
+    k = max(1, min(factors, small - 1, small // 2))
+
+    
+    if small <= DENSE_SVD_LIMIT:
+        # Preserve which user-game pairs were actually observed.
+        dense = matrix.toarray()
+        observed = np.zeros(dense.shape, dtype=bool)
+        observed[rows, cols] = True
+
+        # Iteratively estimate missing entries using a low-rank approximation.
+        for _ in range(50):
+            u, s, vt = np.linalg.svd(dense, full_matrices=False)
+            reconstructed = (u[:, :k] * s[:k]) @ vt[:k]
+
+            updated = dense.copy()
+            updated[~observed] = reconstructed[~observed]
+
+            if np.allclose(updated, dense, atol=1e-6):
+                dense = updated
+                break
+
+            dense = updated
+
+        # Factorize the completed matrix for recommendations.
+        u, s, vt = np.linalg.svd(dense, full_matrices=False)
+        u, s, vt = u[:, :k], s[:k], vt[:k]
+    else:
+        v0 = np.random.default_rng(42).uniform(-1, 1, small)
+        u, s, vt = svds(matrix, k=k, v0=v0)
+
 
     user_factors = u * s
     predicted = np.einsum("ij,ji->i", user_factors[rows], vt[:, cols]) + means[rows]
     rmse = float(np.sqrt(np.mean((np.clip(predicted, 1, 10) - vals) ** 2)))
-    return SvdModel(user_ids, game_ids, means, user_factors, vt, rmse)
+    return SvdModel(user_ids, game_ids, means, user_factors, vt, rmse, k)
 
 
 def recommend_svd(
@@ -205,8 +270,13 @@ def recommend_svd(
     positives: dict[int, set[int]],
     top_n: int = 20,
     chunk: int = 500,
+    min_gain: float = MIN_PREDICTED_GAIN,
 ) -> dict[int, list[Recommendation]]:
     """Top predicted games per user, skipping everything in `seen`.
+
+    Only games the model predicts above the user's own baseline are returned, so a user whose
+    taste the model can't separate from average gets no SVD picks (the API then falls back,
+    and says so) instead of arbitrary ones.
 
     reason_game_id is honest: it is the game among the user's liked ones that sits closest
     to the recommendation in the learned taste space, which is what drives the prediction.
@@ -220,19 +290,27 @@ def recommend_svd(
     results: dict[int, list[Recommendation]] = {}
     for start in range(0, len(model.user_ids), chunk):
         end = min(start + chunk, len(model.user_ids))
-        scores = model.user_factors[start:end] @ model.item_factors + model.user_means[start:end, None]
+        latent = model.user_factors[start:end] @ model.item_factors  # predicted gain over baseline
         for r in range(end - start):
             user_id = model.user_ids[start + r]
-            row = scores[r].copy()
+            gain = latent[r].copy()
             for game_id in seen.get(user_id, ()):
-                if game_id in g_index:
-                    row[g_index[game_id]] = -np.inf
-            available = int(np.isfinite(row).sum())
-            if available == 0:
+                col = g_index.get(game_id)
+                if col is not None:
+                    gain[col] = -np.inf
+
+            print("DEBUG user:", user_id)
+            print("DEBUG baseline:", baseline if "baseline" in locals() else model.user_means[start + r])
+            print("DEBUG game gains:", [
+                (model.game_ids[i], round(float(gain[i]), 4))
+                for i in range(len(gain))
+            ])
+            print("DEBUG min_gain:", min_gain)
+            candidates = np.flatnonzero(gain > min_gain)
+            if candidates.size == 0:
                 continue
-            n = min(top_n, available)
-            top = np.argpartition(-row, n - 1)[:n]
-            top = top[np.argsort(-row[top])]  # rank on the raw score, clip only for display
+            top = candidates[np.argsort(-gain[candidates])[:top_n]]  # rank on raw gain, clip only for display
+            baseline = float(model.user_means[start + r])
             liked = [g_index[g] for g in positives.get(user_id, ()) if g in g_index]
             recs = []
             for idx in top:
@@ -243,7 +321,9 @@ def recommend_svd(
                     if sims[best] > 0:
                         reason = model.game_ids[liked[best]]
                 recs.append(
-                    Recommendation(model.game_ids[idx], float(np.clip(row[idx], 1.0, 10.0)), reason)
+                    Recommendation(
+                        model.game_ids[idx], float(np.clip(baseline + gain[idx], 1.0, 10.0)), reason
+                    )
                 )
             results[user_id] = recs
     return results

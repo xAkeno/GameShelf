@@ -9,20 +9,9 @@ from rest_framework.permissions import IsAuthenticated
 # import numpy as np
 
 from apps.core.models import (
-    Cluster,
-    ClusterMember,
-    Game,
-    GameScore,
-    GameSimilarity,
-    ModelRun,
-    UserDismissedGame,
-    UserGameList,
-    UserRecommendation,
-    Genre,
-    GameExternalId,
-    UserFavoriteGame,
-    UserGenre,
-    UserPlatform,
+    Cluster, ClusterMember, Game, GameLike, GameScore, GameSimilarity, ModelRun, Rating,
+    UserDismissedGame, UserGameList, UserRecommendation,
+    Genre, GameExternalId, UserFavoriteGame, UserGenre, UserPlatform,
 )
 
 from .serializers import (
@@ -31,6 +20,7 @@ from .serializers import (
     GameBriefSerializer,
     GameScoreSerializer,
     RecommendationSerializer,
+    RecommendedGameSerializer,
     SimilarGameSerializer,
 )
 import json
@@ -221,11 +211,25 @@ def int_param(request, name: str, default: int, low: int, high: int) -> int:
 
 
 class RecommendationViewSet(viewsets.ViewSet):
-    """GET /recommendations/ : personalised picks for a logged-in player who has some,
-    otherwise popular games. `source` says which one you got, so the page never claims
-    "because you played ..." for someone with no history."""
+    """GET /recommendations/ and GET /players-like-you/ : the SVD "Players Like You" picks.
+
+    A logged-in player the SVD model has learned something about gets `source: "personalized"`
+    (`algorithm: "svd"`). Everyone else gets popular games with `source: "popular"`,
+    `algorithm: "popularity"` and a `fallback_reason`, so the page never presents a fallback
+    as a collaborative-filtering prediction. Only the requesting user's own rows are ever read.
+    """
 
     permission_classes = [permissions.AllowAny]
+
+    @staticmethod
+    def _hidden_game_ids(user):
+        """Games the player already rated, liked, listed or dismissed, including anything added
+        since the last SVD run."""
+        hidden = set(UserGameList.objects.filter(user=user).values_list("game_id", flat=True))
+        hidden |= set(UserDismissedGame.objects.filter(user=user).values_list("game_id", flat=True))
+        hidden |= set(Rating.objects.filter(user=user).values_list("game_id", flat=True))
+        hidden |= set(GameLike.objects.filter(user=user).values_list("game_id", flat=True))
+        return hidden
 
     def list(self, request):
         try:
@@ -235,37 +239,46 @@ class RecommendationViewSet(viewsets.ViewSet):
 
         limit = max(1, min(limit, 50))
         user = request.user
+        hidden = set()
 
-        if user.is_authenticated:
+        if not user.is_authenticated:
+            fallback_reason = "login_required"
+        else:
+            hidden = self._hidden_game_ids(user)
             run = active_run("svd")
-            if run:
-                # the player may have added, completed or dismissed games since the last run
-                hidden = set(UserGameList.objects.filter(user=user).values_list("game_id", flat=True))
-                hidden |= set(UserDismissedGame.objects.filter(user=user).values_list("game_id", flat=True))
+            if run is None:
+                fallback_reason = "model_not_ready"
+            else:
                 picks = list(
                     UserRecommendation.objects.filter(model_run=run, user=user)
                     .exclude(game_id__in=hidden)
                     .select_related("game", "reason_game")
-                    .prefetch_related("game__genres")
+                    .prefetch_related("game__genres", "game__external_ids")
                     .order_by("rank")[:limit]
                 )
                 if picks:
-                    return Response(
-                        {"source": "personalized", "results": RecommendationSerializer(picks, many=True).data}
-                    )
+                    return Response({
+                        "source": "personalized",
+                        "algorithm": "svd",
+                        "results": RecommendationSerializer(picks, many=True).data,
+                    })
+                fallback_reason = "not_enough_activity"
 
         scores = list(
             GameScore.objects.select_related("game")
-            .prefetch_related("game__genres")
+            .prefetch_related("game__genres", "game__external_ids")
+            .exclude(game_id__in=hidden)
             .order_by(F("bayesian_score").desc(nulls_last=True), "-popularity_score", "game_id")[:limit]
         )
         games = [s.game for s in scores] or list(
-            Game.objects.prefetch_related("genres").order_by("-id")[:limit]
+            Game.objects.exclude(id__in=hidden)
+            .prefetch_related("genres", "external_ids")
+            .order_by("-id")[:limit]
         )
         by_game = {s.game_id: s for s in scores}
         results = [
             {
-                "game": GameBriefSerializer(game).data,
+                "game": RecommendedGameSerializer(game).data,
                 "score": float(by_game[game.id].bayesian_score) if game.id in by_game and by_game[game.id].bayesian_score is not None else None,
                 "rank": rank,
                 "reason_type": "popular",
@@ -274,7 +287,18 @@ class RecommendationViewSet(viewsets.ViewSet):
             }
             for rank, game in enumerate(games, start=1)
         ]
-        return Response({"source": "popular", "results": results})
+        return Response({
+            "source": "popular",
+            "algorithm": "popularity",
+            "fallback_reason": fallback_reason,
+            "results": results,
+        })
+
+
+class PlayersLikeYouViewSet(RecommendationViewSet):
+    """GET /players-like-you/ : same logic and response shape, but login required."""
+
+    permission_classes = [IsAuthenticated]
 
 
 class SimilarGamesViewSet(viewsets.ViewSet):
