@@ -9,6 +9,13 @@ from rest_framework import status as http
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from apps.core.models import Playlist, PlaylistLike
+from .serializers import PlaylistDetailSerializer
+
 
 from apps.core.models import Game, GameExternalId, UserGameList
 from apps.games.serializers import get_steam_game_details
@@ -300,3 +307,13 @@ def search_playlist_games(request):
         if ext and str(ext.external_id).isdigit():
             results.append({"appid": int(ext.external_id), "title": g.title, "cover": g.cover_image_url or ""})
     return Response({"results": results})
+
+class PlaylistViewSet(viewsets.ModelViewSet):
+    queryset = Playlist.objects.filter(deleted_at__isnull=True)
+    serializer_class = PlaylistDetailSerializer
+
+    def get_serializer_context(self):
+        # This line explicitly injects the request into the serializer context!
+        context = super().get_serializer_context()
+        context["request"] = self.request
+        return context
