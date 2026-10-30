@@ -14,7 +14,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
-from rest_framework import mixins, permissions, status, viewsets
+from rest_framework import mixins, permissions, status, viewsets, generics
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
@@ -25,7 +25,7 @@ from apps.core.models import UserGameList
 from apps.core.models import UserFavoriteGame, Game, Friendship, Notification, SecurityEvent
 from apps.core.models.users import UserAchievement
 from apps.core.permissions import IsModeratorOrAdmin
-from .models import UserSanction, SanctionAppeal
+from apps.core.models.users import UserSanction, SanctionAppeal
 from apps.library.views import _get_or_create_game
 from .serializers import (
     ChangePasswordSerializer,

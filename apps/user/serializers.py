@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from rest_framework import serializers
 from datetime import date
-from .models import UserSanction, SanctionAppeal
+from apps.core.models.users import UserSanction, SanctionAppeal
 
 from apps.core.models import Friendship, Rating, Review, Notification
 # Library-specific logic is now cleanly decoupled and imported via service interface
