@@ -5,7 +5,11 @@ Django settings for gameshelf project.
 import os
 from pathlib import Path
 from decouple import config
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
+
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+]
 
 # ─── 1. CORE PATHS ───────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -48,7 +52,9 @@ INSTALLED_APPS = [
     "apps.analytics",
     "apps.moderation",
     "apps.social",
-]
+
+    'django_extensions']
+
 
 STEAM_API_KEY = config("STEAM_API_KEY")
 
@@ -162,6 +168,8 @@ REST_FRAMEWORK = {
 }
 
 
+
+
 # ─── 13. EMAIL & FRONTEND URLS ────────────────────────────────────────────────
 FRONTEND_URL = "http://localhost:5173"
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
@@ -169,5 +177,15 @@ DEFAULT_FROM_EMAIL = "noreply@gameshelf.local"
 
 
 # ─── 14. THIRD-PARTY API KEYS ────────────────────────────────────────────────
-# STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "5D48239956EB027F5F31D265CD43BD9A")
+STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "5D48239956EB027F5F31D265CD43BD9A")
 STEAM_API_KEY=os.environ.get("STEAM_API_KEY", "86D0AF9A74DB5528C3CBAE796F7DF4F8")
+
+
+# ─── 15. optimization ────────────────────────────────────────────────
+# settings.py
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "unique-snowflake",
+    }
+}

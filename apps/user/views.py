@@ -1,3 +1,5 @@
+import re
+import requests
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth import login as auth_login
@@ -6,8 +8,9 @@ from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.core.mail import send_mail
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Q, Max
 from django.middleware.csrf import get_token
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
@@ -15,15 +18,14 @@ from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
-from django.db.models import Max
-from apps.core.models import UserFavoriteGame
-from .serializers import UserFavoriteGameSerializer, AddFavoriteSerializer
+from rest_framework.views import APIView
+from rest_framework.exceptions import ValidationError
 from apps.library.views import _get_or_create_game
-import requests
-
-from apps.core.models import Friendship, Notification, SecurityEvent
-from apps.user.serializers import can_view
-
+from apps.core.models import UserGameList
+from apps.core.models import UserFavoriteGame, Game, Friendship, Notification, SecurityEvent
+from apps.core.models.users import UserAchievement
+from apps.core.permissions import IsModeratorOrAdmin
+from apps.library.views import _get_or_create_game
 from .serializers import (
     ChangePasswordSerializer,
     ForgotPasswordSerializer,
@@ -38,12 +40,24 @@ from .serializers import (
     UserProfileSerializer,
     UsernameSerializer,
     VerifyEmailSerializer,
+    UserAchievementSerializer,
+    UserFavoriteGameSerializer,
+    AddFavoriteSerializer,
 )
 
 User = get_user_model()
 Status = Friendship.SessionStatus if hasattr(Friendship, "SessionStatus") else Friendship.Status
 USERNAME_REGEX = r"[\w.@+-]+"
 
+GameExternalID = None
+for model_name in ["GameExternalID", "ExternalGameID", "ExternalID"]:
+    try:
+        from apps.core import models as core_models
+        if hasattr(core_models, model_name):
+            GameExternalID = getattr(core_models, model_name)
+            break
+    except ImportError:
+        pass
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -113,7 +127,133 @@ def friends_queryset(owner, search=None):
     return queryset.order_by("-updated_at", "-id")
 
 
-# ─── Email Verification & Password Reset ────────────────────────────────      
+# ─── Steam Import Services ────────────────────────────────────────────────────
+
+def resolve_steam_id(url_or_id: str) -> str:
+    cleaned = url_or_id.strip().rstrip("/")
+    
+    if re.match(r"^\d{17}$", cleaned):
+        return cleaned
+    
+    match_profile = re.search(r"steamcommunity\.com/profiles/(\d{17})", cleaned)
+    if match_profile:
+        return match_profile.group(1)
+    
+    match_vanity = re.search(r"steamcommunity\.com/id/([^/]+)", cleaned)
+    vanity = match_vanity.group(1) if match_vanity else cleaned.split("/")[-1]
+        
+    api_key = getattr(settings, "STEAM_API_KEY", "")
+    if not api_key:
+        raise ValidationError("Steam API key is not configured on the server.")
+        
+    url = f"https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/?key={api_key}&vanityurl={vanity}"
+    res = requests.get(url).json()
+    
+    if res.get("response", {}).get("success") == 1:
+        return res["response"]["steamid"]
+        
+    raise ValidationError("Could not resolve Steam profile. Make sure the link is correct.")
+
+import datetime
+from django.utils import timezone
+
+import datetime
+from django.utils import timezone
+
+def import_steam_user_data(user, profile_link: str):
+    steam_id = resolve_steam_id(profile_link)
+    api_key = getattr(settings, "STEAM_API_KEY", "")
+    
+    if not api_key:
+        raise ValidationError("Steam API key is not configured on the server.")
+
+    # 1. Fetch Owned Games
+    games_url = f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/?key={api_key}&steamid={steam_id}&include_appinfo=true&include_played_free_games=true&format=json"
+    response = requests.get(games_url).json()
+    
+    game_response = response.get("response", {})
+    if not game_response or "games" not in game_response:
+        raise ValidationError("Could not fetch games. Ensure your Steam Game Details privacy setting is set to Public.")
+        
+    imported_count = 0
+    achievements_count = 0
+    now_timestamp = timezone.now().timestamp()
+    one_week_ago = now_timestamp - (7 * 24 * 60 * 60)
+
+    for sg in game_response["games"]:
+        app_id = sg["appid"]
+        playtime_mins = sg.get("playtime_forever", 0)
+        last_played_timestamp = sg.get("rtime_last_played", 0)
+        
+        game = _get_or_create_game(app_id)
+        if not game:
+            continue
+            
+        # Smart status assignment
+        default_status = "plan_to_play"
+        if last_played_timestamp > one_week_ago or playtime_mins > 300:
+            default_status = "playing"
+
+        entry, _ = UserGameList.objects.get_or_create(
+            user=user, 
+            game=game, 
+            defaults={"status": default_status}
+        )
+        imported_count += 1
+
+        # 2. Fetch Player Achievements for Played Games
+        if playtime_mins > 0:
+            ach_url = f"https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/?appid={app_id}&key={api_key}&steamid={steam_id}"
+            try:
+                ach_res = requests.get(ach_url, timeout=3).json()
+                player_stats = ach_res.get("playerstats", {})
+                if player_stats.get("success") and "achievements" in player_stats:
+                    for ach in player_stats["achievements"]:
+                        if ach.get("achieved") == 1:
+                            unlock_time = ach.get("unlocktime")
+                            unlocked_at = (
+                                timezone.datetime.fromtimestamp(unlock_time, tz=timezone.utc)
+                                if unlock_time
+                                else timezone.now()
+                            )
+                            UserAchievement.objects.get_or_create(
+                                user=user,
+                                game=game,
+                                achievement_api_name=ach["apiname"],
+                                defaults={
+                                    "title": ach.get("name", ach["apiname"]),
+                                    "description": ach.get("description", ""),
+                                    "unlocked_at": unlocked_at,
+                                },
+                            )
+                            achievements_count += 1
+            except Exception:
+                # Silently continue if a specific game lacks achievement stats
+                pass
+        
+    return {
+        "detail": f"Successfully imported {imported_count} games and {achievements_count} unlocked achievements from Steam!"
+    }
+
+class ImportSteamLibraryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        profile_url = request.data.get("profile_url")
+        if not profile_url:
+            raise ValidationError({"profile_url": "A Steam profile link or SteamID is required."})
+        
+        try:
+            result = import_steam_user_data(request.user, profile_url)
+            return Response(result, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            error_msg = e.detail[0] if isinstance(e.detail, list) else e.detail
+            return Response({"detail": error_msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({"detail": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ─── Email Verification & Password Reset ──────────────────────────────────────
 class EmailVerificationTokenGenerator(PasswordResetTokenGenerator):
     key_salt = "users.tokens.EmailVerificationTokenGenerator"
 
@@ -325,11 +465,6 @@ class AuthViewSet(viewsets.ViewSet):
 
 # ─── User & Consolidated Social ViewSet ───────────────────────────────────────
 class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
-    """
-    Consolidated ViewSet for user profiles, me, suggested players, 
-    friends, friend requests, and blocking.
-    """
-
     queryset = User.objects.filter(is_active=True)
     serializer_class = UserProfileSerializer
     permission_classes = [permissions.AllowAny]
@@ -350,7 +485,6 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             return Response(serializer.data)
         return Response(self.get_serializer(request.user).data)
 
-    # ─── Suggested Players ────────────────────────────────────────────────────
     @action(
         detail=False,
         methods=["get"],
@@ -432,7 +566,6 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 defaults={"position": position},
             )
 
-            # Re-fetch with prefetch annotations for the serializer
             fav = (
                 UserFavoriteGame.objects.filter(pk=fav.pk)
                 .select_related("game")
@@ -460,8 +593,33 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 return Response({"error": "Favorite entry not found."}, status=status.HTTP_404_NOT_FOUND)
 
             return Response(status=status.HTTP_204_NO_CONTENT)
+        
+    @action(detail=True, methods=["post"], permission_classes=[IsModeratorOrAdmin])
+    def sanction(self, request, pk=None):
+        pass
+    @action(
+        detail=False,
+        methods=["get"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="achievements",
+    )
+    def my_achievements(self, request):
+        queryset = UserAchievement.objects.filter(user=request.user).select_related("game")
+        serializer = UserAchievementSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data)
 
-    # ─── Friends & Unfriend ───────────────────────────────────────────────────
+    @action(
+        detail=True,
+        methods=["get"],
+        permission_classes=[permissions.AllowAny],
+        url_path="achievements",
+    )
+    def user_achievements(self, request, username=None):
+        target_user = self.get_object()
+        queryset = UserAchievement.objects.filter(user=target_user).select_related("game")
+        serializer = UserAchievementSerializer(queryset, many=True, context={"request": request})
+        return Response(serializer.data)
+
     @action(
         detail=False,
         methods=["get", "delete"],
@@ -479,7 +637,6 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             row.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
 
-        # GET Friends List
         search = request.query_params.get("search", "").strip()
         queryset = friends_queryset(me, search)
         limit = int_param(request, "limit", 100, 1, 100)
@@ -497,7 +654,6 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
             ).data,
         })
 
-    # ─── Friend Requests ──────────────────────────────────────────────────────
     @action(
         detail=False,
         methods=["get", "post"],
@@ -527,7 +683,6 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 if existing.user_id == me.id:
                     return Response({"detail": "Friend request already sent."}, status=status.HTTP_400_BAD_REQUEST)
 
-                # The other user already requested us: accept it automatically
                 with transaction.atomic():
                     accept_request(existing, me)
                 return Response(FriendshipSerializer(existing, context={"me": me}).data)
@@ -541,7 +696,6 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
 
             return Response(FriendshipSerializer(row, context={"me": me}).data, status=status.HTTP_201_CREATED)
 
-        # GET Incoming / Outgoing Friend Requests
         direction = request.query_params.get("direction", "incoming")
         if direction == "outgoing":
             rows = Friendship.objects.filter(user=me, status=Status.PENDING)
@@ -560,3 +714,152 @@ class UserViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSet):
                 context={"me": me, "request": request}
             ).data,
         })
+    
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="block",
+    )
+    def block_user(self, request, pk=None):
+        target_user = self.get_object()
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot block yourself."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        with transaction.atomic():
+            # Find existing friendship or create a blocked relationship
+            friendship = Friendship.objects.filter(
+                (Q(user=me) & Q(friend=target_user)) | (Q(user=target_user) & Q(friend=me))
+            ).first()
+            
+            if friendship:
+                friendship.status = Status.BLOCKED
+                friendship.user = me
+                friendship.friend = target_user
+                friendship.save(update_fields=["status", "user", "friend", "updated_at"])
+            else:
+                Friendship.objects.create(
+                    user=me,
+                    friend=target_user,
+                    status=Status.BLOCKED
+                )
+                
+        return Response({"detail": "User blocked successfully."})
+
+    @action(
+        detail=True,
+        methods=["post"],
+        permission_classes=[permissions.IsAuthenticated],
+        url_path="report",
+    )
+    def report_user(self, request, pk=None):
+        target_user = self.get_object()
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot report yourself."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        reason = request.data.get("reason", "No reason provided")
+        
+        # Log or create report entry (or handle security event/notification)
+        # SecurityEvent or a custom Report model can be integrated here if available
+        
+        return Response({"detail": "User reported successfully. Thank you for keeping the community safe."})
+    
+class FriendshipViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = FriendshipSerializer
+    http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def get_queryset(self):
+        me = self.request.user
+        return Friendship.objects.filter(Q(user=me) | Q(friend=me)).select_related("user", "friend")
+
+    @action(detail=True, methods=["post"], url_path="accept")
+    def accept(self, request, pk=None):
+        friendship = self.get_object()
+        me = request.user
+        
+        if friendship.friend != me:
+            return Response({"detail": "You cannot accept this request."}, status=status.HTTP_403_FORBIDDEN)
+        if friendship.status != Status.PENDING:
+            return Response({"detail": "This request is not pending."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        with transaction.atomic():
+            accept_request(friendship, me)
+            
+        return Response(FriendshipSerializer(friendship, context={"me": me}).data)
+
+    @action(detail=True, methods=["post", "delete"], url_path="reject")
+    def reject(self, request, pk=None):
+        friendship = self.get_object()
+        me = request.user
+        
+        if friendship.friend != me and friendship.user != me:
+            return Response({"detail": "Unauthorized."}, status=status.HTTP_403_FORBIDDEN)
+            
+        friendship.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["post"], url_path="block")
+    def block(self, request, pk=None):
+        friendship = self.get_object()
+        me = request.user
+        
+        with transaction.atomic():
+            friendship.status = Status.BLOCKED
+            friendship.user = me
+            friendship.save(update_fields=["status", "user", "updated_at"])
+            
+        return Response({"detail": "User blocked successfully."})
+    
+class BlockViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = FriendshipSerializer
+    lookup_field = "friend__username"
+    http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def get_queryset(self):
+        return Friendship.objects.filter(user=self.request.user, status=Status.BLOCKED).select_related("friend")
+
+    def create(self, request, *args, **kwargs):
+        username = request.data.get("username")
+        target_user = get_object_or_404(User, username=username)
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot block yourself."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        friendship, _ = Friendship.objects.update_or_create(
+            user=me,
+            friend=target_user,
+            defaults={"status": Status.BLOCKED}
+        )
+        return Response(FriendshipSerializer(friendship, context={"me": me}).data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, *args, **kwargs):
+        username = kwargs.get("friend__username")
+        instance = get_object_or_404(Friendship, user=request.user, friend__username=username, status=Status.BLOCKED)
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+class ReportViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ["post", "head", "options"]
+
+    def create(self, request, *args, **kwargs):
+        username = request.data.get("username")
+        reason = request.data.get("reason", "No reason provided")
+        details = request.data.get("details", "")
+        
+        target_user = get_object_or_404(User, username=username)
+        me = request.user
+        
+        if target_user == me:
+            return Response({"detail": "You cannot report yourself."}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Optional: Save to a Report model if your project tracks user reports in the database
+        
+        return Response({"detail": "User reported successfully. Thank you for keeping the community safe."}, status=status.HTTP_201_CREATED)

@@ -25,6 +25,7 @@ STEAM = "steam"
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 
 
+
 def _steam_search(term):
     key = f"steam:search:{term.lower()}"
     items = cache.get(key)

@@ -1,8 +1,15 @@
 # Django discovers models through this file, so every model must be imported here.
 # Existing imports such as `from core.models import Game` keep working.
 from .base import SoftDeleteModel, TimeStampedModel  # noqa: F401
-from .users import (  # noqa: F401
-    Friendship, Notification, SanctionAppeal, User, UserFavoriteGame, UserSanction,
+
+from .users import (
+    Friendship,
+    Notification,
+    SanctionAppeal,
+    User,
+    UserFavoriteGame,
+    UserPlatform,
+    UserSanction,
 )
 from .games import (  # noqa: F401
     Award, Developer, Game, GameAward, GameDeveloper, GameExternalId, GameGenre,
@@ -24,4 +31,3 @@ from .recommendations import (  # noqa: F401
     RecommendationEvent, UserRecommendation,
 )
 from .system import AdminAuditLog, DailySiteStat, SecurityEvent, SiteSetting  # noqa: F401
-

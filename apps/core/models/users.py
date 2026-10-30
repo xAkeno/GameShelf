@@ -13,11 +13,10 @@ USER = settings.AUTH_USER_MODEL
 class User(AbstractUser):
     """Custom user. AbstractUser already provides username, password, is_active,
     is_staff and date_joined (exposed here as created_at)."""
-
     class Role(models.TextChoices):
-        USER = "user"
-        MODERATOR = "moderator"
-        ADMIN = "admin"
+        USER = "user", "User"
+        MODERATOR = "moderator", "Moderator"
+        ADMIN = "admin", "Admin"
 
     class Visibility(models.TextChoices):
         PUBLIC = "public"
@@ -29,7 +28,12 @@ class User(AbstractUser):
     bio = models.TextField(null=True, blank=True)
     avatar_url = models.TextField(null=True, blank=True)
     banner_url = models.TextField(null=True, blank=True)
-    role = models.CharField(max_length=20, choices=Role.choices, default=Role.USER)
+    
+    # Demographics
+    age = models.PositiveSmallIntegerField(null=True, blank=True)
+    gender = models.CharField(max_length=50, null=True, blank=True)
+    pronouns = models.CharField(max_length=50, null=True, blank=True)
+
     email_verified_at = models.DateTimeField(null=True, blank=True)
     library_visibility = models.CharField(
         max_length=20, choices=Visibility.choices, default=Visibility.PUBLIC
@@ -49,12 +53,18 @@ class User(AbstractUser):
         return self.date_joined
 
     @property
-    def is_moderator(self):
-        return self.role in (self.Role.MODERATOR, self.Role.ADMIN)
-
-    @property
     def is_suspended(self):
         return self.suspended_until is not None and self.suspended_until > timezone.now()
+    
+    role = models.CharField(
+        max_length=20, 
+        choices=Role.choices, 
+        default=Role.USER
+    )
+
+    @property
+    def is_moderator(self):
+        return self.role in (self.Role.MODERATOR, self.Role.ADMIN)
 
 
 class Friendship(TimeStampedModel):
@@ -94,6 +104,32 @@ class UserFavoriteGame(models.Model):
             models.UniqueConstraint(fields=["user", "game"], name="uniq_favorite_user_game"),
             models.UniqueConstraint(fields=["user", "position"], name="uniq_favorite_user_position"),
             models.CheckConstraint(condition=Q(position__gte=1), name="favorite_position_gte_1"),
+        ]
+
+
+class UserAchievement(models.Model):
+    """Stores user achievements pulled via the Steam API."""
+
+    user = models.ForeignKey(USER, on_delete=models.CASCADE, related_name="achievements")
+    game = models.ForeignKey("Game", on_delete=models.CASCADE, related_name="user_achievements")
+    achievement_api_name = models.CharField(max_length=100)
+    title = models.CharField(max_length=255, null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    icon_url = models.TextField(null=True, blank=True)
+    achieved = models.BooleanField(default=False)
+    unlock_time = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "user_achievements"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "game", "achievement_api_name"],
+                name="uniq_user_game_achievement",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["user", "game"], name="user_achievement_lookup_idx")
         ]
 
 
@@ -154,3 +190,32 @@ class Notification(models.Model):
         db_table = "notifications"
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["user", "read_at"], name="notification_user_read_idx")]
+
+
+class UserPlatform(models.Model):
+    class PlatformType(models.TextChoices):
+        WINDOWS = "windows", "Windows"
+        MAC = "mac", "macOS"
+        LINUX = "linux", "Linux"
+
+    user = models.ForeignKey(
+        USER,
+        on_delete=models.CASCADE,
+        related_name="preferred_platforms",
+    )
+    platform = models.CharField(
+        max_length=20,
+        choices=PlatformType.choices,
+    )
+
+    class Meta:
+        db_table = "user_platforms"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "platform"],
+                name="uniq_user_platform",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.user} - {self.platform}"

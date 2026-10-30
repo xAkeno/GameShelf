@@ -9,6 +9,11 @@ router.register("recommendations", views.RecommendationViewSet, basename="recomm
 router.register("similar", views.SimilarGamesViewSet, basename="similar")
 router.register("top-games", views.TopGamesViewSet, basename="top-games")
 router.register("clusters", views.ClusterViewSet, basename="cluster")
+router.register(
+    "taste",
+    views.TasteRecommendationViewSet,
+    basename="taste",
+)
 
 urlpatterns = [
     path("", include(router.urls)),
