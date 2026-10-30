@@ -25,6 +25,7 @@ from apps.core.models import UserGameList
 from apps.core.models import UserFavoriteGame, Game, Friendship, Notification, SecurityEvent
 from apps.core.models.users import UserAchievement
 from apps.core.permissions import IsModeratorOrAdmin
+from .models import UserSanction, SanctionAppeal
 from apps.library.views import _get_or_create_game
 from .serializers import (
     ChangePasswordSerializer,
@@ -43,6 +44,8 @@ from .serializers import (
     UserAchievementSerializer,
     UserFavoriteGameSerializer,
     AddFavoriteSerializer,
+    SanctionAppealSerializer,
+    UserSanctionSerializer,
 )
 
 User = get_user_model()
@@ -863,3 +866,26 @@ class ReportViewSet(viewsets.ModelViewSet):
         # Optional: Save to a Report model if your project tracks user reports in the database
         
         return Response({"detail": "User reported successfully. Thank you for keeping the community safe."}, status=status.HTTP_201_CREATED)
+    
+class MySanctionsListView(generics.ListAPIView):
+    """GET /api/v1/sanctions/my/ — List all sanctions belonging to the logged-in user."""
+    serializer_class = UserSanctionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        # Retrieve sanctions belonging to the current user (excluding revoked ones if desired)
+        return UserSanction.objects.filter(
+            user=self.request.user,
+            revoked_at__isnull=True
+        ).order_by("-created_at")
+
+
+class SanctionAppealCreateView(generics.CreateAPIView):
+    """POST /api/v1/sanctions/appeals/ — Submit an appeal against a specific sanction."""
+    serializer_class = SanctionAppealSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["request"] = self.request
+        return context

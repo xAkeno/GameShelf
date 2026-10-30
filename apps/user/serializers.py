@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from rest_framework import serializers
 from datetime import date
-
+from .models import UserSanction, SanctionAppeal
 
 from apps.core.models import Friendship, Rating, Review, Notification
 # Library-specific logic is now cleanly decoupled and imported via service interface
@@ -436,3 +436,45 @@ class UserAchievementSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "game_id", "game_title", "updated_at"]
+
+
+class UserSanctionSerializer(serializers.ModelSerializer):
+    """Serializer to list sanctions applied to the user."""
+    class Meta:
+        model = UserSanction
+        fields = [
+            "id", "sanction_type", "reason", 
+            "starts_at", "ends_at", "revoked_at", "created_at"
+        ]
+        read_only_fields = fields
+
+
+class SanctionAppealSerializer(serializers.ModelSerializer):
+    """Serializer for submitting and reading sanction appeals."""
+    sanction_detail = UserSanctionSerializer(source="sanction", read_only=True)
+
+    class Meta:
+        model = SanctionAppeal
+        fields = [
+            "id", "sanction", "sanction_detail", 
+            "message", "status", "reviewed_at", "created_at"
+        ]
+        read_only_fields = ["id", "sanction_detail", "status", "reviewed_at", "created_at"]
+
+    def validate_sanction(self, value):
+        user = self.context["request"].user
+
+        # Rule 1: The sanction must belong to the requesting user
+        if value.user != user:
+            raise serializers.ValidationError("You can only appeal sanctions applied to your own account.")
+
+        # Rule 2: Check if there's already an active/open appeal for this sanction
+        if SanctionAppeal.objects.filter(sanction=value, user=user, status=SanctionAppeal.Status.OPEN).exists():
+            raise serializers.ValidationError("An open appeal for this sanction is already pending review.")
+
+        return value
+
+    def create(self, validated_data):
+        # Automatically attach the requesting user
+        validated_data["user"] = self.context["request"].user
+        return super().create(validated_data)
