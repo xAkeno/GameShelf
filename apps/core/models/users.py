@@ -33,6 +33,7 @@ class User(AbstractUser):
     age = models.PositiveSmallIntegerField(null=True, blank=True)
     gender = models.CharField(max_length=50, null=True, blank=True)
     pronouns = models.CharField(max_length=50, null=True, blank=True)
+    birth_day = models.DateField(null=True, blank=True)
 
     email_verified_at = models.DateTimeField(null=True, blank=True)
     library_visibility = models.CharField(
