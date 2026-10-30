@@ -120,7 +120,7 @@ class PlaylistGameSearchSerializer(serializers.ModelSerializer):
     class Meta:
         model = Game
         fields = ["id", "title", "cover_image_url"]
-        
+
 class AbsoluteMediaURLMixin:
     """Ensures avatar_url and banner_url are returned as absolute URIs."""
     def to_representation(self, instance):
@@ -143,7 +143,7 @@ class AbsoluteMediaURLMixin:
 class PlaylistOwnerSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ["id", "username", "nickname", "avatar_url"]
+        fields = ["id", "username", "nickname", "avatar_url", "visibiility", "banner_url", "bio"]
 
 # --- PLAYLIST GAME SERIALIZER ---
 class PlaylistGameSerializer(serializers.ModelSerializer):

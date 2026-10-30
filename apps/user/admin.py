@@ -6,10 +6,10 @@ User = get_user_model()
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
-    list_display = ["id", "username", "email", "is_staff", "created_at",]
+    list_display = ["id", "username", "email", "is_staff", "created_at","birth_day"]
     search_fields = ["username", "email"]
 
 @admin.register(Friendship)
 class FriendshipAdmin(admin.ModelAdmin):
-    list_display = ["id", "user", "friend", "status", "created_at"]
+    list_display = ["id", "user", "friend", "status", "created_at", ]
     list_filter = ["status"]
