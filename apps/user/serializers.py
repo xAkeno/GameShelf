@@ -9,7 +9,8 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from rest_framework import serializers
-
+from datetime import date
+from apps.core.models.users import UserSanction, SanctionAppeal
 
 from apps.core.models import Friendship, Rating, Review, Notification
 # Library-specific logic is now cleanly decoupled and imported via service interface
@@ -226,17 +227,39 @@ class UserMeSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
     created_at = serializers.DateTimeField(source="date_joined", read_only=True)
     avatar_file = serializers.ImageField(write_only=True, required=False)
     banner_file = serializers.ImageField(write_only=True, required=False)
-
+    
     class Meta:
         model = User
         fields = [
             "id", "username", "email", "email_verified", "role",
             "nickname", "bio", "avatar_url", "banner_url",
             "library_visibility", "friends_visibility", "created_at",
-            "avatar_file", "banner_file","pronouns"
+            "avatar_file", "banner_file","pronouns", "birth_day"
         ]
         read_only_fields = ["id", "username", "email", "role"]
 
+
+    def validate_birth_day(self, value):
+        if not value:
+            return value
+
+        if self.instance and self.instance.birth_day:
+            if value != self.instance.birth_day:
+                raise serializers.ValidationError("Birthday has already been set and cannot be changed.")
+
+        # Rule 2: Cannot be younger than 5 years old (or in the future/today)
+        today = date.today()
+        
+        # Check if future date or today
+        if value >= today:
+            raise serializers.ValidationError("Birthday cannot be today or in the future.")
+
+        # Calculate age
+        age = today.year - value.year - ((today.month, today.day) < (value.month, value.day))
+        if age < 5:
+            raise serializers.ValidationError("You must be at least 5 years old.")
+
+        return value
     def get_email_verified(self, obj) -> bool:
         return obj.email_verified_at is not None
 
@@ -413,3 +436,45 @@ class UserAchievementSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "game_id", "game_title", "updated_at"]
+
+
+class UserSanctionSerializer(serializers.ModelSerializer):
+    """Serializer to list sanctions applied to the user."""
+    class Meta:
+        model = UserSanction
+        fields = [
+            "id", "sanction_type", "reason", 
+            "starts_at", "ends_at", "revoked_at", "created_at"
+        ]
+        read_only_fields = fields
+
+
+class SanctionAppealSerializer(serializers.ModelSerializer):
+    """Serializer for submitting and reading sanction appeals."""
+    sanction_detail = UserSanctionSerializer(source="sanction", read_only=True)
+
+    class Meta:
+        model = SanctionAppeal
+        fields = [
+            "id", "sanction", "sanction_detail", 
+            "message", "status", "reviewed_at", "created_at"
+        ]
+        read_only_fields = ["id", "sanction_detail", "status", "reviewed_at", "created_at"]
+
+    def validate_sanction(self, value):
+        user = self.context["request"].user
+
+        # Rule 1: The sanction must belong to the requesting user
+        if value.user != user:
+            raise serializers.ValidationError("You can only appeal sanctions applied to your own account.")
+
+        # Rule 2: Check if there's already an active/open appeal for this sanction
+        if SanctionAppeal.objects.filter(sanction=value, user=user, status=SanctionAppeal.Status.OPEN).exists():
+            raise serializers.ValidationError("An open appeal for this sanction is already pending review.")
+
+        return value
+
+    def create(self, validated_data):
+        # Automatically attach the requesting user
+        validated_data["user"] = self.context["request"].user
+        return super().create(validated_data)

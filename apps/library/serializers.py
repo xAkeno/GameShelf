@@ -1,6 +1,8 @@
 from rest_framework import serializers
-from apps.core.models import Game, Playlist, PlaylistGame, UserGameList
-
+from django.contrib.auth import get_user_model
+from apps.core.models import Game, Playlist, PlaylistGame, UserGameList, PlaylistLike
+from django.conf import settings
+User = get_user_model()
 
 class UserGameListSerializer(serializers.ModelSerializer):
     """One row of the user's list, flattened for the frontend."""
@@ -118,3 +120,94 @@ class PlaylistGameSearchSerializer(serializers.ModelSerializer):
     class Meta:
         model = Game
         fields = ["id", "title", "cover_image_url"]
+
+class AbsoluteMediaURLMixin:
+    """Ensures avatar_url and banner_url are returned as absolute URIs."""
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+
+        for field in ("avatar_url", "banner_url"):
+            url = data.get(field)
+            if url and not url.startswith("http"):
+                if request:
+                    data[field] = request.build_absolute_uri(url)
+                else:
+                    # Fallback if request context was omitted in Django View
+                    base_url = getattr(settings, "BACKEND_URL", "http://127.0.0.1:8000")
+                    data[field] = f"{base_url.rstrip('/')}{url}"
+
+        return data
+
+# --- OWNER SERIALIZER (Fixes missing avatar_url) ---
+class PlaylistOwnerSerializer(AbsoluteMediaURLMixin, serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["id", "username", "nickname", "avatar_url", "visibiility", "banner_url", "bio"]
+
+# --- PLAYLIST GAME SERIALIZER ---
+class PlaylistGameSerializer(serializers.ModelSerializer):
+    steam_appid = serializers.SerializerMethodField()
+    cover_url = serializers.CharField(source="game.cover_image_url", read_only=True)
+    title = serializers.CharField(source="game.title", read_only=True)
+    genres = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PlaylistGame
+        fields = ["id", "steam_appid", "title", "cover_url", "genres", "position", "note"]
+
+    def get_steam_appid(self, obj):
+        ext = next((e for e in obj.game.external_ids.all() if e.source == "steam"), None)
+        if ext:
+            try:
+                return int(ext.external_id)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def get_genres(self, obj):
+        return [g.name for g in obj.game.genres.all()]
+
+
+# --- PLAYLIST DETAIL SERIALIZER ---
+class PlaylistDetailSerializer(serializers.ModelSerializer):
+    # DRF auto-passes context to fields declared like this, 
+    # but make sure request is present in view context
+    owner = PlaylistOwnerSerializer(source="user", read_only=True)
+    games = serializers.SerializerMethodField()
+    like_count = serializers.SerializerMethodField()
+    is_liked = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Playlist
+        fields = [
+            "id",
+            "title",
+            "description",
+            "visibility",
+            "cover_image_url",
+            "owner",
+            "games",
+            "like_count",
+            "is_liked",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_games(self, obj):
+        pgs = (
+            obj.playlist_games.select_related("game")
+            .prefetch_related("game__external_ids", "game__genres")
+            .order_by("position")
+        )
+        # Explicitly pass self.context to nested serializers
+        return PlaylistGameSerializer(pgs, many=True, context=self.context).data
+
+    def get_like_count(self, obj):
+        return obj.likes.count()
+
+    def get_is_liked(self, obj):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            return obj.likes.filter(user=request.user).exists()
+        return False

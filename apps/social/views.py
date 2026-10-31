@@ -864,6 +864,17 @@ class CommunityPlaylistViewSet(GenericViewSet):
             )
         )
 
+    @action(detail=False, methods=["get"], permission_classes=[permissions.IsAuthenticated])
+    def mine(self, request):
+        """GET /social/playlists/mine/ -> only the logged-in user's playlists (public + private)."""
+        queryset = (
+            Playlist.objects.filter(user=request.user, deleted_at__isnull=True)
+            .select_related("user")
+            .order_by("-updated_at", "-id")
+        )
+        page = self.paginate_queryset(queryset)
+        return self.get_paginated_response(_serialize_playlists(page))
+
     @action(detail=False, methods=["get"])
     def genres(self, request):
         """Genres that actually exist in public playlists (for the filter dropdown)."""
