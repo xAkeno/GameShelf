@@ -37,15 +37,18 @@ def steam_games():
     return _load_steam_games()
 
 
+@lru_cache(maxsize=8)
+def _read_artifact(filename, mtime_ns):
+    # mtime_ns is only part of the cache key: when the job rewrites the file,
+    # the key changes and the new file is parsed once.
+    with (RECOMMENDATION_DIR / filename).open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
 def load_recommendation_artifact(filename):
     path = RECOMMENDATION_DIR / filename
-
-    if not path.exists():
-        return None
-
     try:
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
+        return _read_artifact(filename, path.stat().st_mtime_ns)
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -338,7 +341,9 @@ class SimilarGamesViewSet(viewsets.ViewSet):
                 "reason": item.get("reason", {}),
             })
 
-        return Response({"results": results})
+        response = Response({"results": results})
+        response["Cache-Control"] = "public, max-age=3600"
+        return response
 
 
 class TopGamesViewSet(viewsets.ViewSet):

@@ -12,6 +12,12 @@ from apps.games.serializers import (
     search_steam_store,
     search_steam_titles,
 )
+from apps.games.steam_store import (
+    get_details,
+    get_details_many,
+    get_rating_summaries_many,
+    load_details,
+)
 from apps.reviews.serializers import rating_stats_for
 from django.conf import settings
 from django.core.cache import cache
@@ -88,18 +94,20 @@ def steam_game_list(request):
     )
     last_appid = _to_int(request.query_params.get("last_appid"), 0)
 
-    try:
-        result = get_steam_game_list(
-            api_key=settings.STEAM_API_KEY,
-            last_appid=last_appid,
-            limit=limit,
-        )
-    except Exception as e:
-        logger.exception("Failed to fetch steam game list from Steam API")
-        return Response(
-            {"error": f"Steam API error: {str(e)}"},
-            status=status.HTTP_502_BAD_GATEWAY,
-        )
+    list_key = f"steam:applist:{last_appid}:{limit}"
+    result = cache.get(list_key)
+    if result is None:
+        try:
+            result = get_steam_game_list(
+                api_key=settings.STEAM_API_KEY, last_appid=last_appid, limit=limit
+            )
+        except Exception as e:
+            logger.exception("Failed to fetch steam game list from Steam API")
+            return Response(
+                {"error": f"Steam API error: {str(e)}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        cache.set(list_key, result, 60 * 60)
 
     if request.query_params.get("expand") == "1":
         try:
@@ -119,25 +127,19 @@ def steam_game_list(request):
 
 @api_view(["GET"])
 def steam_game_details(request, app_id):
-    cache_key = f"steam:details:{app_id}"
-    game = cache.get(cache_key)
+    try:
+        game = get_details(app_id)
+    except requests.RequestException:
+        return Response(
+            {"error": "Unable to fetch game details from Steam."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
 
     if game is None:
-        try:
-            game = get_steam_game_details(app_id)
-        except requests.RequestException:
-            return Response(
-                {"error": "Unable to fetch game details from Steam."},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        if game is None:
-            return Response(
-                {"error": "Game not found on Steam."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        cache.set(cache_key, game, DETAILS_CACHE_SECONDS)
+        return Response(
+            {"error": "Game not found on Steam."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
     return Response(game, status=status.HTTP_200_OK)
 
@@ -177,17 +179,7 @@ def steam_game_reviews(request, app_id):
 # Browse helpers
 # ---------------------------------------------------------------------------
 def _details_for(app_id):
-    """Cached appdetails (same cache key as steam_game_details)."""
-    key = f"steam:details:{app_id}"
-    game = cache.get(key)
-    if game is None:
-        try:
-            game = get_steam_game_details(app_id)
-        except requests.RequestException:
-            return None
-        if game is not None:
-            cache.set(key, game, DETAILS_CACHE_SECONDS)
-    return game
+    return get_details_many([app_id]).get(int(app_id))
 
 
 def _browse_card(app_id, details):
@@ -270,36 +262,36 @@ def _my_scores_for(user, game_to_app):
     return {game_to_app[game_id]: score for game_id, score in rows}
 
 
-def _steam_rating_for(app_id):
-    """
-    Third-party rating: Steam's positive-review share, scaled to 0-10.
-    Cached server-side for 6 hours.
-    """
-    key = f"steam:rating:{app_id}"
-    cached = cache.get(key)
-    if cached is not None:
-        return cached or None
+# def _steam_rating_for(app_id):
+#     """
+#     Third-party rating: Steam's positive-review share, scaled to 0-10.
+#     Cached server-side for 6 hours.
+#     """
+#     key = f"steam:rating:{app_id}"
+#     cached = cache.get(key)
+#     if cached is not None:
+#         return cached or None
 
-    try:
-        data = get_steam_game_reviews(app_id, num_per_page=1)
-    except requests.RequestException:
-        return None
+#     try:
+#         data = get_steam_game_reviews(app_id, num_per_page=1)
+#     except requests.RequestException:
+#         return None
 
-    summary = data.get("summary") or {}
-    total = summary.get("total_reviews") or 0
-    positive = summary.get("total_positive") or 0
+#     summary = data.get("summary") or {}
+#     total = summary.get("total_reviews") or 0
+#     positive = summary.get("total_positive") or 0
 
-    result = (
-        {
-            "score": round(positive / total * 10, 1),
-            "label": summary.get("review_score_desc") or "",
-            "total_reviews": total,
-        }
-        if total
-        else {}
-    )
-    cache.set(key, result, STEAM_RATING_CACHE_SECONDS)
-    return result or None
+#     result = (
+#         {
+#             "score": round(positive / total * 10, 1),
+#             "label": summary.get("review_score_desc") or "",
+#             "total_reviews": total,
+#         }
+#         if total
+#         else {}
+#     )
+#     cache.set(key, result, STEAM_RATING_CACHE_SECONDS)
+#     return result or None
 
 
 def _summary_card(app_id, details, rating, steam_rating):
@@ -320,12 +312,12 @@ def _summary_card(app_id, details, rating, steam_rating):
 def _build_summaries(app_ids, user=None):
     app_ids = list(dict.fromkeys(app_ids))
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        details = list(executor.map(_details_for, app_ids))
-        steam_ratings = list(executor.map(_steam_rating_for, app_ids))
+    details = get_details_many(app_ids)
+    game_ids = [a for a in app_ids if details.get(a) and details[a].get("type") == "game"]
+    steam_ratings = get_rating_summaries_many(game_ids)  # only for real games
 
     try:
-        stats = rating_stats_for(app_ids, user)
+        stats = rating_stats_for(game_ids, user)
     except Exception:
         logger.exception("rating lookup failed")
         stats = {}
@@ -333,9 +325,8 @@ def _build_summaries(app_ids, user=None):
     empty = {"my_score": None, "average": None, "count": 0}
 
     return [
-        _summary_card(app_id, d, stats.get(app_id, empty), steam)
-        for app_id, d, steam in zip(app_ids, details, steam_ratings)
-        if d and d.get("type") == "game"
+        _summary_card(app_id, details[app_id], stats.get(app_id, empty), steam_ratings.get(app_id))
+        for app_id in game_ids
     ]
 
 
@@ -378,17 +369,16 @@ def _store_search_page(term, tag_id, platform_os, sort_by, page):
             count=BROWSE_PAGE_SIZE,
         )
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        details = list(executor.map(_details_for, appids))
+    details, failed = load_details(appids)
 
     cards = [
-        _browse_card(app_id, d)
-        for app_id, d in zip(appids, details)
-        if d and d.get("type") == "game"
+        _browse_card(app_id, details[app_id])
+        for app_id in appids
+        if details.get(app_id) and details[app_id].get("type") == "game"
     ]
 
     result = (cards, total)
-    if all(details):
+    if not failed:  # don't cache a page that's missing games because Steam hiccuped
         cache.set(key, result, POOL_CACHE_SECONDS)
     return result
 
@@ -474,7 +464,9 @@ def steam_top_rated(request):
 
     result = bayesian_weighted_rating(stats, min_votes=TOP_RATED_MIN_VOTES)
     if not result.scores:
-        return Response({"results": [], "min_votes": result.min_votes, "global_mean": None})
+        return Response(
+            {"results": [], "min_votes": result.min_votes, "global_mean": round(result.global_mean, 2)}
+        )
 
     ranked = sorted(
         result.scores.items(),
