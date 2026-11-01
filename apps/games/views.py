@@ -19,7 +19,7 @@ from django.db.models import Avg, Count
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-
+from apps.recommendation.algorithms import bayesian_weighted_rating
 logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = 12
@@ -48,6 +48,9 @@ GENRE_TAGS = {
     "roguelike": 1716,
     "horror": 1667,
 }
+
+TOP_RATED_MIN_VOTES = 5   # "m" in the Bayesian formula
+TOP_RATED_DEFAULT_LIMIT = 20
 
 # Frontend platform slug -> Steam `os` param
 PLATFORM_OS = {"windows": "win", "mac": "mac", "linux": "linux"}
@@ -448,3 +451,84 @@ def steam_game_summaries(request):
         )
 
     return Response({"results": results})
+
+@api_view(["GET"])
+def steam_top_rated(request):
+    """
+    GET /games/steam/top-rated/?limit=20
+    Ranks games by GameShelf user ratings (not likes) using the shared
+    bayesian_weighted_rating from recommendations/algorithms.py.
+    """
+    limit = min(
+        _to_int(request.query_params.get("limit"), TOP_RATED_DEFAULT_LIMIT, 1),
+        MAX_SUMMARY_IDS,
+    )
+
+    # {game_id: (average rating, number of ratings)}
+    rows = Rating.objects.values("game_id").annotate(
+        average=Avg("score"), count=Count("id")
+    )
+    stats = {
+        row["game_id"]: (float(row["average"]), row["count"]) for row in rows
+    }
+
+    result = bayesian_weighted_rating(stats, min_votes=TOP_RATED_MIN_VOTES)
+    if not result.scores:
+        return Response({"results": [], "min_votes": result.min_votes, "global_mean": None})
+
+    ranked = sorted(
+        result.scores.items(),
+        key=lambda item: (-item[1], -stats[item[0]][1]),  # score, then rating count
+    )
+
+    # Over-fetch: some games may have no Steam id or no Steam details.
+    candidates = ranked[: limit * 2]
+    game_ids = [game_id for game_id, _ in candidates]
+
+    model, source_field, value_field = _external_id_fields()
+    links = model.objects.filter(game_id__in=game_ids)
+    if source_field:
+        links = links.filter(**{f"{source_field}__iexact": "steam"})
+    game_to_app = {
+        game_id: int(ext)
+        for game_id, ext in links.values_list("game_id", value_field)
+        if str(ext).isdigit()
+    }
+
+    # {steam app id: (bayesian score, average, count)}
+    stats_by_app = {}
+    for game_id, bayes in candidates:
+        app_id = game_to_app.get(game_id)
+        if app_id is not None:
+            average, count = stats[game_id]
+            stats_by_app[app_id] = (bayes, average, count)
+
+    app_ids = list(stats_by_app)[:MAX_SUMMARY_IDS]
+    if not app_ids:
+        return Response(
+            {"results": [], "min_votes": result.min_votes, "global_mean": result.global_mean}
+        )
+
+    try:
+        cards = _build_summaries(app_ids, request.user)
+    except requests.RequestException:
+        return Response(
+            {"error": "Unable to fetch game details from Steam."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    for card in cards:
+        bayes, average, count = stats_by_app[card["appid"]]
+        card["bayesian_score"] = round(bayes, 2)
+        card["community_rating"] = round(average, 1)
+        card["rating_count"] = count
+
+    cards.sort(key=lambda c: -c["bayesian_score"])
+
+    return Response(
+        {
+            "results": cards[:limit],
+            "min_votes": result.min_votes,
+            "global_mean": round(result.global_mean, 2),
+        }
+    )
