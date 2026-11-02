@@ -31,6 +31,7 @@ from apps.core.models import (
     Review,
     ReviewComment,
     ReviewLike,
+    GameLike,
 )
 from apps.reviews.serializers import (
     CommentCreateSerializer,
@@ -216,6 +217,45 @@ def game_rating(request, app_id):
 
     return Response(_rating_stats(game, request.user))
 
+
+# ---------------------------------------------------------------------------
+# Game likes  (one per user per game)
+# ---------------------------------------------------------------------------
+def _like_stats(game, user):
+    if game is None:
+        return {"liked": False, "like_count": 0}
+
+    return {
+        "liked": (
+            user.is_authenticated
+            and GameLike.objects.filter(game=game, user=user).exists()
+        ),
+        "like_count": GameLike.objects.filter(game=game).count(),
+    }
+
+
+@api_view(["GET", "PUT", "DELETE"])
+@permission_classes([IsAuthenticatedOrReadOnly])
+def game_like(request, app_id):
+    """
+    GET    /reviews/likes/<app_id>/ -> { liked, like_count }
+    PUT    /reviews/likes/<app_id>/ -> like the game
+    DELETE /reviews/likes/<app_id>/ -> remove my like
+    """
+    if request.method == "GET":
+        game, _ = _resolve_game(app_id, create=False)
+        return Response(_like_stats(game, request.user))
+
+    game, error = _resolve_game(app_id, create=request.method == "PUT")
+    if error:
+        return error
+
+    if request.method == "PUT":
+        GameLike.objects.get_or_create(user=request.user, game=game)
+    elif game is not None:
+        GameLike.objects.filter(user=request.user, game=game).delete()
+
+    return Response(_like_stats(game, request.user))
 
 # ---------------------------------------------------------------------------
 # GameShelf reviews

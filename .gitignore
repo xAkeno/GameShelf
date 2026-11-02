@@ -3,6 +3,10 @@ venv/
 .venv/
 env/
 
+# Django database
+db.sqlite3
+*.sqlite3
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -22,12 +26,8 @@ media/
 .vscode/
 .idea/
 .DS_Store
-<<<<<<< HEAD
-Thumbs.db
-=======
 Thumbs.db
 
 # Large generated game datasets
 data/recommendations/tfidf_similarities.json
 data/steam_games_reduced.json
->>>>>>> 205125e9e5dfac2f37b36d4af8e3adbfc783c38b

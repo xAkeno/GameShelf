@@ -9,6 +9,7 @@ from .views import (
     review_comments,
     review_detail,
     review_like,
+    game_like
 )
 
 urlpatterns = [
@@ -30,7 +31,7 @@ urlpatterns = [
     # Comments
     path("comments/<int:comment_id>/", comment_detail, name="comment-detail"),
     path("comments/<int:comment_id>/like/", comment_like, name="comment-like"),
-
+    path("likes/<int:app_id>/", game_like, name="game-like"),
     # Third-party reviews
     path(
         "external-reviews/<int:app_id>/",
