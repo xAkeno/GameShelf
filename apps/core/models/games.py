@@ -2,7 +2,7 @@ from django.db import models
 from django.db.models import F, Q
 
 from .base import TimeStampedModel
-
+from django.utils import timezone  # add to the imports of that file
 
 class Game(TimeStampedModel):
     class GameType(models.TextChoices):
@@ -305,3 +305,16 @@ class GameExternalId(models.Model):
                 fields=["source", "external_id"], name="uniq_external_source_id"
             ),
         ]
+
+class SteamAppCache(models.Model):
+    """Local copy of Steam store data, so Steam is only asked once per game."""
+
+    app_id = models.PositiveBigIntegerField(primary_key=True)
+    data = models.JSONField(null=True, blank=True)           # Steam appdetails `data`
+    not_found = models.BooleanField(default=False)           # Steam said "no such game"
+    fetched_at = models.DateTimeField(default=timezone.now)
+    rating_summary = models.JSONField(null=True, blank=True)  # {score, label, total_reviews} or {}
+    rating_fetched_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "steam_app_cache"
