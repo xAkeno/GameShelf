@@ -1,13 +1,19 @@
 
+from sys import platform
+
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from django.utils.text import slugify
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import CharField
+from django.db.models.functions import Cast
+from django.db.models import Q , Count
 from django.utils import timezone
 
+from apps.core.models.games import GameExternalId, SteamAppCache
+from apps.core.models.library import PlaylistLike
 from rest_framework import permissions, status
 from rest_framework.decorators import action
 from rest_framework.generics import get_object_or_404
@@ -24,6 +30,7 @@ from apps.core.models import Playlist, PlaylistGame, Game
 from apps.core.models import Friendship, Notification
 from apps.user.serializers import can_view
 
+
 from .serializers import (
     FriendshipSerializer,
     NotificationSerializer,
@@ -36,8 +43,19 @@ User = get_user_model()
 Status = Friendship.Status
 USERNAME_REGEX = r"[\w.@+-]+"
 
+PLATFORMS = ("windows", "mac", "linux")
 
 MAX_GENRE_SYNC = 12  # games looked up per page view
+
+#steam Helper
+def steam_platform_games(platform):
+    """GameExternalId rows (Steam) for games that support this platform."""
+    app_ids = (
+        SteamAppCache.objects.filter(**{f"data__platforms__{platform}": True})
+        .annotate(app_str=Cast("app_id", CharField()))
+        .values("app_str")
+    )
+    return GameExternalId.objects.filter(source="steam", external_id__in=app_ids)
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -724,18 +742,21 @@ def _fill_missing_genres(links):
 
     return saved
 
-
-def _serialize_playlists(playlists, genre="", platform="", sync=False):
+#Playlist Likes
+def _serialize_playlists(playlists, genre="", platform="", sync=False, user=None):
     """Playlist rows -> dicts matching the frontend's Playlist type.
 
     With genre/platform set, `games` only holds the matching games,
     while `game_count` stays the playlist's full size.
     With sync=True, games that have no genres get them from Steam first.
+    `user` is the viewer, used to work out whether they've liked each playlist.
     """
+
+    playlist_ids = [p.id for p in playlists]
 
     def load_links():
         return list(
-            PlaylistGame.objects.filter(playlist_id__in=[p.id for p in playlists])
+            PlaylistGame.objects.filter(playlist_id__in=playlist_ids)
             .select_related("game")
             .prefetch_related("game__external_ids", "game__genres")
             .order_by("position")
@@ -750,12 +771,25 @@ def _serialize_playlists(playlists, genre="", platform="", sync=False):
     platform = platform.strip().lower()
 
     platform_ids = None
-    if platform in ("windows", "mac", "linux"):
+    if platform in PLATFORMS:
         platform_ids = set(
-            Game.objects.filter(
-                id__in=[l.game_id for l in links],
-                platforms__slug=platform,  # <- adjust to your Game model
-            ).values_list("id", flat=True)
+            steam_platform_games(platform)
+            .filter(game_id__in=[l.game_id for l in links])
+            .values_list("game_id", flat=True)
+        )
+
+    # Likes: one query for the counts, one for what the viewer has liked
+    like_counts = dict(
+        PlaylistLike.objects.filter(playlist_id__in=playlist_ids)
+        .order_by()
+        .values_list("playlist_id")
+        .annotate(n=Count("id"))
+    )
+    liked_ids = set()
+    if user is not None and user.is_authenticated:
+        liked_ids = set(
+            PlaylistLike.objects.filter(playlist_id__in=playlist_ids, user=user)
+            .values_list("playlist_id", flat=True)
         )
 
     games_by_playlist = {}
@@ -780,6 +814,7 @@ def _serialize_playlists(playlists, genre="", platform="", sync=False):
 
     results = []
     for p in playlists:
+        is_liked = p.id in liked_ids
         results.append({
             "id": p.id,
             "title": p.title,
@@ -792,8 +827,9 @@ def _serialize_playlists(playlists, genre="", platform="", sync=False):
                 "avatar_url": getattr(p.user, "avatar_url", None),
             },
             "game_count": totals.get(p.id, 0),
-            "like_count": 0,        # TODO: wire to your likes table
-            "liked_by_me": False,   # TODO
+            "like_count": like_counts.get(p.id, 0),
+            "is_liked": is_liked,
+            "liked_by_me": is_liked,  # kept so existing code using this name still works
             "games": games_by_playlist.get(p.id, []),
             "created_at": p.created_at,
             "updated_at": p.updated_at,
@@ -802,9 +838,11 @@ def _serialize_playlists(playlists, genre="", platform="", sync=False):
 
 class CommunityPlaylistViewSet(GenericViewSet):
     """
-    GET /playlists/?search=&user=&genre=&platform=&sort=&limit=12&offset=0
-    GET /playlists/genres/
-    GET /playlists/<id>/
+    GET  /playlists/?search=&user=&genre=&platform=&sort=&limit=12&offset=0
+    GET  /playlists/genres/
+    GET  /playlists/<id>/
+    POST /playlists/<id>/like/   (toggles like for the logged-in user)
+    POST /playlists/<id>/copy/   (copies the playlist into the logged-in user's library)
     """
 
     permission_classes = [permissions.AllowAny]
@@ -843,10 +881,10 @@ class CommunityPlaylistViewSet(GenericViewSet):
             )
 
         platform = (params.get("platform") or "").strip().lower()
-        if platform in ("windows", "mac", "linux"):
+        if platform in PLATFORMS:
             queryset = queryset.filter(
                 id__in=PlaylistGame.objects.filter(
-                    game__platforms__slug=platform  # <- adjust to your Game model
+                    game_id__in=steam_platform_games(platform).values("game_id")
                 ).values("playlist_id")
             )
 
@@ -861,6 +899,7 @@ class CommunityPlaylistViewSet(GenericViewSet):
                 page,
                 genre=params.get("genre") or "",
                 platform=params.get("platform") or "",
+                user=request.user,
             )
         )
 
@@ -873,7 +912,7 @@ class CommunityPlaylistViewSet(GenericViewSet):
             .order_by("-updated_at", "-id")
         )
         page = self.paginate_queryset(queryset)
-        return self.get_paginated_response(_serialize_playlists(page))
+        return self.get_paginated_response(_serialize_playlists(page, user=request.user))
 
     @action(detail=False, methods=["get"])
     def genres(self, request):
@@ -890,15 +929,82 @@ class CommunityPlaylistViewSet(GenericViewSet):
         )
         return Response(list(names))
 
-    def retrieve(self, request, pk=None):
+    def _get_visible_playlist(self, request, pk):
         playlist = get_object_or_404(
             Playlist.objects.select_related("user"),
             pk=pk,
             deleted_at__isnull=True,
         )
-
         is_owner = request.user.is_authenticated and playlist.user_id == request.user.id
         if playlist.visibility == "private" and not is_owner:
             raise NotFound("Playlist not found.")
+        return playlist
 
-        return Response(_serialize_playlists([playlist], sync=True)[0])
+    def retrieve(self, request, pk=None):
+        playlist = self._get_visible_playlist(request, pk)
+        data = _serialize_playlists([playlist], sync=True, user=request.user)[0]
+        data["is_owner"] = bool(
+            request.user.is_authenticated and playlist.user_id == request.user.id
+        )
+        return Response(data)
+
+    @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
+    def like(self, request, pk=None):
+        """POST /playlists/<id>/like/ -> like if not liked yet, unlike if already liked."""
+        playlist = self._get_visible_playlist(request, pk)
+
+        like, created = PlaylistLike.objects.get_or_create(playlist=playlist, user=request.user)
+        if not created:
+            like.delete()
+
+        return Response({
+            "is_liked": created,
+            "like_count": PlaylistLike.objects.filter(playlist=playlist).count(),
+        })
+
+    @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
+    def copy(self, request, pk=None):
+        """POST /playlists/<id>/copy/ -> copies a playlist into the user's own library (private)."""
+        source = self._get_visible_playlist(request, pk)
+
+        if source.user_id == request.user.id:
+            return Response(
+                {"detail": "This is already your playlist."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Keep the "(copy)" title inside the column's max length
+        suffix = " (copy)"
+        max_len = Playlist._meta.get_field("title").max_length
+        title = (
+            source.title[: max_len - len(suffix)] + suffix
+            if max_len
+            else source.title + suffix
+        )
+
+        has_note = any(f.name == "note" for f in PlaylistGame._meta.get_fields())
+
+        with transaction.atomic():
+            new_playlist = Playlist.objects.create(
+                user=request.user,
+                title=title,
+                description=source.description,
+                visibility="private",  # the copier decides when to make it public
+            )
+
+            links = []
+            for link in PlaylistGame.objects.filter(playlist=source).order_by("position"):
+                kwargs = {
+                    "playlist": new_playlist,
+                    "game_id": link.game_id,
+                    "position": link.position,
+                }
+                if has_note:
+                    kwargs["note"] = link.note
+                links.append(PlaylistGame(**kwargs))
+            PlaylistGame.objects.bulk_create(links)
+
+        new_playlist = Playlist.objects.select_related("user").get(pk=new_playlist.pk)
+        data = _serialize_playlists([new_playlist], user=request.user)[0]
+        data["is_owner"] = True
+        return Response(data, status=status.HTTP_201_CREATED)
