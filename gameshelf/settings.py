@@ -157,6 +157,9 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
     ],
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.ScopedRateThrottle",
+    ],
     "DEFAULT_THROTTLE_RATES": {
         "register": "5/hour",
         "login": "10/minute",
@@ -164,9 +167,9 @@ REST_FRAMEWORK = {
         "password_forgot": "5/hour",
         "password_reset": "20/hour",
         "friend_request": "20/hour",
-    },
+        "infinite_scroll": "30/minute",  # Generous for human scrolling, blocks scrapers
+    }
 }
-
 
 
 
