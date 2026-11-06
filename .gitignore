@@ -31,3 +31,4 @@ Thumbs.db
 # Large generated game datasets
 data/recommendations/tfidf_similarities.json
 data/steam_games_reduced.json
+data/

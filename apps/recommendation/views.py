@@ -6,6 +6,7 @@ from django.db import transaction
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
+
 # import numpy as np
 
 from apps.core.models import (
@@ -303,9 +304,8 @@ class PlayersLikeYouViewSet(RecommendationViewSet):
 
     permission_classes = [IsAuthenticated]
 
-
 class SimilarGamesViewSet(viewsets.ViewSet):
-    """GET /similar/<game_id>/ : the "Similar titles" row on a game page."""
+    """GET /similar/<game_id>/ : fetches similar games with fallback and offset pagination."""
 
     permission_classes = [permissions.AllowAny]
 
@@ -319,32 +319,121 @@ class SimilarGamesViewSet(viewsets.ViewSet):
             )
 
         artifact = load_recommendation_artifact("tfidf_similarities.json")
+        limit = int_param(request, "limit", default=20, low=1, high=50)
+        offset = int_param(request, "offset", default=0, low=0, high=1_000_000)
+        
+        games_dict = artifact.get("games", {}) if artifact else {}
+        similarities = games_dict.get(str(appid), [])
 
-        if not artifact:
-            return Response({"results": []})
+        # FALLBACK: If the specific liked game has no precomputed similarity entry,
+        # pull from other available keys so the carousel never stays empty!
+        if not similarities and games_dict:
+            all_fallback_ids = list(games_dict.keys())
+            similarities = [{"appid": int(fid), "score": 1.0, "rank": i} for i, fid in enumerate(all_fallback_ids[:60])]
 
-        limit = int_param(request, "limit", default=10, low=1, high=50)
-        similarities = artifact.get("games", {}).get(str(appid), [])
+        has_more = len(similarities) > offset + limit
+        paged_similarities = similarities[offset:offset + limit]
 
+        seen_appids = set()
+        seen_titles = set()
         results = []
 
-        for item in similarities[:limit]:
-            game = steam_game_payload(item["appid"])
+        for item in paged_similarities:
+            target_appid = item.get("appid")
+            if not target_appid or target_appid in seen_appids:
+                continue
 
+            game = steam_game_payload(target_appid)
             if game is None:
                 continue
 
+            # Strict 1:1 case-insensitive name deduplication
+            clean_title = game.get("title", "").strip().casefold()
+            if clean_title in seen_titles:
+                continue
+
+            seen_appids.add(target_appid)
+            seen_titles.add(clean_title)
+
             results.append({
                 "game": game,
-                "score": item["score"],
-                "rank": item["rank"],
+                "score": item.get("score", 1.0),
+                "rank": item.get("rank", 1),
                 "reason": item.get("reason", {}),
             })
 
-        response = Response({"results": results})
+        response = Response({
+            "results": results,
+            "has_more": has_more,
+            "count": len(results)
+        })
         response["Cache-Control"] = "public, max-age=3600"
         return response
+    """GET /similar/<game_id>/ : fetches similar games with fallback if the game isn't in the artifact."""
 
+    permission_classes = [permissions.AllowAny]
+
+    def retrieve(self, request, pk=None):
+        try:
+            appid = int(pk)
+        except (TypeError, ValueError):
+            return Response(
+                {"results": [], "detail": "Invalid Steam app ID."},
+                status=400,
+            )
+
+        artifact = load_recommendation_artifact("tfidf_similarities.json")
+        limit = int_param(request, "limit", default=20, low=1, high=50)
+        offset = int_param(request, "offset", default=0, low=0, high=1_000_000)
+        
+        # Get similarities for this appid, or fallback to an empty list if missing
+        similarities = artifact.get("games", {}).get(str(appid), []) if artifact else []
+
+        # FALLBACK: If the specific liked game has no precomputed similarities, 
+        # pull top games so the carousel never stays empty!
+        if not similarities and artifact:
+            # Grab all available game appids from the artifact keys as a fallback pool
+            all_fallback_ids = list(artifact.get("games", {}).keys())
+            # Or pull from top Bayesian scores if available
+            similarities = [{"appid": int(fid), "score": 1.0, "rank": i} for i, fid in enumerate(all_fallback_ids[:50])]
+
+        has_more = len(similarities) > offset + limit
+        paged_similarities = similarities[offset:offset + limit]
+
+        seen_appids = set()
+        seen_titles = set()
+        results = []
+
+        for item in paged_similarities:
+            target_appid = item["appid"]
+            if target_appid in seen_appids:
+                continue
+
+            game = steam_game_payload(target_appid)
+            if game is None:
+                continue
+
+            clean_title = game["title"].strip().casefold()
+            if clean_title in seen_titles:
+                continue
+
+            seen_appids.add(target_appid)
+            seen_titles.add(clean_title)
+
+            results.append({
+                "game": game,
+                "score": item.get("score", 1.0),
+                "rank": item.get("rank", 1),
+                "reason": item.get("reason", {}),
+            })
+
+        response = Response({
+            "results": results,
+            "has_more": has_more,
+            "count": len(results)
+        })
+        response["Cache-Control"] = "public, max-age=3600"
+        return response
 
 class TopGamesViewSet(viewsets.ViewSet):
     """GET /top-games/?ordering=rating|popularity|trending&limit=20&offset=0"""
@@ -455,6 +544,7 @@ class TasteRecommendationViewSet(viewsets.ViewSet):
     """
 
     permission_classes = [IsAuthenticated]
+    throttle_scope = "infinite_scroll"
 
     @action(detail=False, methods=["get"], url_path="options", url_name="options")
     def interest_options(self, request):
@@ -618,9 +708,20 @@ class TasteRecommendationViewSet(viewsets.ViewSet):
                 allowed[row] = False
 
         limit = int_param(request, "limit", default=20, low=1, high=50)
+        offset = int_param(request, "offset", default=0, low=0, high=1000000)
+
         ranked = algorithms.rank_by_interest(
-            model.matrix, model.labels, model.centroids, interest, allowed, model.quality, limit=limit
+            model.matrix,
+            model.labels,
+            model.centroids,
+            interest,
+            allowed,
+            model.quality,
+            limit=offset + limit + 1,
         )
+
+        has_more = len(ranked) > offset + limit
+        ranked = ranked[offset:offset + limit]
 
         # "Because you like X": the liked game closest to each result
         games = steam_games()
@@ -646,7 +747,7 @@ class TasteRecommendationViewSet(viewsets.ViewSet):
             results.append({
                 "game": payload,
                 "score": round(score, 4),
-                "rank": len(results) + 1,
+                "rank": offset + len(results) + 1,
                 "cluster_id": cluster_id,
                 "cluster_label": model.cluster_names.get(cluster_id),
                 "reason": {
@@ -664,6 +765,7 @@ class TasteRecommendationViewSet(viewsets.ViewSet):
         return Response({
             "source": "kmeans_taste",
             "count": len(results),
+            "has_more": has_more,
             "preferences": preferences,
             "results": results,
         })
