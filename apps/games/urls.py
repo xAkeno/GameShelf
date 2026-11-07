@@ -1,5 +1,7 @@
 from django.urls import path
 
+
+
 from .views import (
     steam_game_browse,
     steam_game_details,
@@ -7,6 +9,7 @@ from .views import (
     steam_game_reviews,
     steam_game_summaries,
     steam_top_rated,
+    popular_games_list,
 )
 
 urlpatterns = [
@@ -15,6 +18,7 @@ urlpatterns = [
     path("steam/summaries/", steam_game_summaries, name="steam-game-summaries"),
     path("steam/top-rated/", steam_top_rated, name="steam-top-rated"),
     path("steam/<int:app_id>/", steam_game_details, name="steam-game-details"),
+    path("steam/popular/", popular_games_list, name="popular-games"),
     path(
         "steam/<int:app_id>/reviews/",
         steam_game_reviews,

@@ -570,8 +570,9 @@ def rank_by_interest(matrix, labels, centroids, interest, allowed, quality, limi
         ranked = [(int(rows[i]), float(score[i]), float(game_sims[i])) for i in top]
         if len(ranked) >= limit:
             break
-    return ranked
 
+    return ranked
+# time matrix__________________________________________________________
 
 def taste_matrix(values: dict[tuple[int, int], float], game_genres: dict[int, list[str]], min_interactions: int = 3):
     """Players x genres affinity (each row L2-normalised), for clustering players by taste.
@@ -600,3 +601,50 @@ def taste_matrix(values: dict[tuple[int, int], float], game_genres: dict[int, li
     if not rows:
         raise NotEnoughData("No players have enough activity to compare yet.")
     return user_ids, genre_names, np.vstack(rows)
+
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+
+def moving_average_popularity(
+    rating_events: list[tuple[int, datetime]],
+    window_days: int = 31,
+    now: datetime | None = None,
+) -> dict[int, float]:
+    """Ranks games by their recent rating activity.
+
+    rating_events: [(game_id, created_at), ...]
+
+    Counts ratings per day, then calculates the average daily rating
+    activity over the rolling window.
+
+    Returns game_id -> average daily ratings.
+    """
+    if window_days < 1:
+        raise ValueError("window_days must be at least 1")
+
+    if not rating_events:
+        return {}
+
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=window_days)
+
+    daily_counts = defaultdict(lambda: defaultdict(int))
+
+    for game_id, created_at in rating_events:
+        if created_at is None:
+            continue
+
+        if created_at.tzinfo is None:
+            raise ValueError("Rating timestamps must be timezone-aware")
+
+        if cutoff <= created_at <= now:
+            daily_counts[game_id][created_at.date()] += 1
+
+    scores = {}
+
+    for game_id, days in daily_counts.items():
+        total = sum(days.values())
+        scores[game_id] = float(total / window_days)
+
+    return scores

@@ -14,7 +14,6 @@ class Rating(TimeStampedModel):
     user = models.ForeignKey(USER, on_delete=models.CASCADE, related_name="ratings")
     game = models.ForeignKey("Game", on_delete=models.CASCADE, related_name="ratings")
     score = models.SmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(10)])
-    status = models.CharField(max_length=20, default="published")
 
     class Meta:
         db_table = "ratings"
@@ -24,7 +23,6 @@ class Rating(TimeStampedModel):
                 condition=Q(score__gte=1) & Q(score__lte=10), name="rating_score_1_10"
             ),
         ]
-
 
 class Review(TimeStampedModel, SoftDeleteModel):
     class Status(models.TextChoices):

@@ -26,6 +26,9 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from apps.recommendation.algorithms import bayesian_weighted_rating
+from collections import defaultdict, Counter
+from datetime import datetime, timedelta, timezone
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = 12
@@ -556,5 +559,96 @@ def steam_top_rated(request):
             "results": cards[:limit],
             "min_votes": result.min_votes,
             "global_mean": round(result.global_mean, 2),
+        }
+    )
+
+# ---------------------------------------------------------------------------
+# Popular Now (31-day rolling moving average)
+# ---------------------------------------------------------------------------
+
+def _popular_now(window_days=31):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+    # Filter ratings within the selected timeframe
+    recent_ratings = Rating.objects.filter(
+        created_at__gte=cutoff
+    ).values_list("game_id", "created_at")
+
+    if not recent_ratings:
+        return []
+
+    daily_counts = defaultdict(lambda: defaultdict(int))
+    for game_id, created_at in recent_ratings:
+        if created_at:
+            daily_counts[game_id][created_at.date()] += 1
+
+    scores = []
+    for game_id, days in daily_counts.items():
+        total = sum(days.values())
+        score = float(total / window_days)
+        scores.append((game_id, score))
+
+    # Sort descending by moving average score
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top_game_ids = [item[0] for item in scores[:40]]
+
+    # Map internal Game IDs to Steam app IDs
+    model, source_field, value_field = _external_id_fields()
+
+    links = model.objects.filter(game_id__in=top_game_ids)
+
+    if source_field:
+        links = links.filter(**{f"{source_field}__iexact": "steam"})
+
+    game_to_app = {
+        game_id: int(ext)
+        for game_id, ext in links.values_list("game_id", value_field)
+        if str(ext).isdigit()
+    }
+    app_scores = []
+    for game_id, score in scores:
+        app_id = game_to_app.get(game_id)
+        if app_id is not None:
+            app_scores.append((app_id, score))
+
+    return app_scores
+
+
+@api_view(["GET"])
+def popular_games_list(request):
+    """
+    GET /api/v1/games/steam/popular/?days=31&limit=20
+    Returns full game summary cards ranked by recent 31-day rating activity.
+    """
+    limit = min(
+        _to_int(request.query_params.get("limit"), TOP_RATED_DEFAULT_LIMIT, 1),
+        MAX_SUMMARY_IDS,
+    )
+    window_days = _to_int(request.query_params.get("days"), 31, 1)
+
+    app_scores = _popular_now(window_days=window_days)
+    if not app_scores:
+        return Response({"results": []})
+
+    app_ids = [app_id for app_id, _ in app_scores[:limit * 2]]
+    stats_by_app = {app_id: score for app_id, score in app_scores}
+
+    try:
+        cards = _build_summaries(app_ids, request.user)
+    except requests.RequestException:
+        return Response(
+            {"error": "Unable to fetch game details from Steam."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    for card in cards:
+        card["popularity_score"] = round(stats_by_app.get(card["appid"], 0.0), 3)
+
+    cards.sort(key=lambda c: -c["popularity_score"])
+
+    return Response(
+        {
+            "results": cards[:limit],
+            "window_days": window_days,
         }
     )

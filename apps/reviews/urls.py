@@ -18,7 +18,6 @@ urlpatterns = [
 
     # Per-game GameShelf reviews (own prefix so it can't clash with review ids)
     path("steam/<int:app_id>/", game_reviews, name="game-reviews"),
-
     # Per-review
     path("<int:review_id>/", review_detail, name="review-detail"),
     path("<int:review_id>/like/", review_like, name="review-like"),

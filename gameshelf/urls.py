@@ -32,6 +32,7 @@ urlpatterns = [
     path("api/v1/reviews/", include("apps.reviews.urls")),
     path("api/v1/moderation/", include("apps.moderation.urls")),
     path("api/v1/social/", include("apps.social.urls")),
+    
 
     # Recommendation endpoints
     path("api/v1/", include("apps.recommendation.urls")),

@@ -1,3 +1,5 @@
+from datetime import timedelta
+from typing import Counter
 import uuid
 
 import requests
@@ -111,11 +113,10 @@ def _live(model_qs):
 # ---------------------------------------------------------------------------
 def _reviews_qs(request):
     live_comments = Q(
-        comments__status=ReviewComment.Status.PUBLISHED,
         comments__deleted_at__isnull=True,
     )
     return (
-        _live(Review.objects.filter(status=Review.Status.PUBLISHED))
+        _live(Review.objects.all())
         .select_related("user")
         .annotate(
             like_count=Count("likes", distinct=True),
@@ -125,7 +126,6 @@ def _reviews_qs(request):
                 Rating.objects.filter(
                     user=OuterRef("user"),
                     game=OuterRef("game"),
-                    status="published",
                 ).values("score")[:1]
         ),
         )
@@ -134,7 +134,7 @@ def _reviews_qs(request):
 
 def _comments_qs(request):
     return (
-        _live(ReviewComment.objects.filter(status=ReviewComment.Status.PUBLISHED))
+        _live(ReviewComment.objects.all())
         .select_related("user")
         .prefetch_related("attachments")
         .annotate(
@@ -146,13 +146,13 @@ def _comments_qs(request):
 
 def _get_review_or_404(review_id):
     return get_object_or_404(
-        _live(Review.objects.filter(status=Review.Status.PUBLISHED)), pk=review_id
+        _live(Review.objects.all()), pk=review_id
     )
 
 
 def _get_comment_or_404(comment_id):
     return get_object_or_404(
-        _live(ReviewComment.objects.filter(status=ReviewComment.Status.PUBLISHED)),
+        _live(ReviewComment.objects.all()),
         pk=comment_id,
     )
 
@@ -173,7 +173,6 @@ def _rating_stats(game, user):
 
     aggregate = Rating.objects.filter(
         game=game,
-        status="published",
     ).aggregate(
         average=Avg("score"),
         count=Count("id"),
@@ -185,7 +184,6 @@ def _rating_stats(game, user):
             Rating.objects.filter(
                 game=game,
                 user=user,
-                status="published",
             )
             .values_list("score", flat=True)
             .first()
@@ -198,13 +196,14 @@ def _rating_stats(game, user):
         "count": aggregate["count"],
     }
 
+
 @api_view(["GET", "PUT", "DELETE"])
 @permission_classes([IsAuthenticatedOrReadOnly])
 def game_rating(request, app_id):
     """
-    GET    /ratings/steam/<app_id>/          -> { my_score, average, count }
-    PUT    /ratings/steam/<app_id>/ {score}  -> set / change my rating
-    DELETE /ratings/steam/<app_id>/          -> remove my rating
+    GET    -> rating statistics
+    PUT    -> set/change rating
+    DELETE -> remove rating
     """
     if request.method == "GET":
         game, _ = _resolve_game(app_id, create=False)
@@ -217,14 +216,15 @@ def game_rating(request, app_id):
     if request.method == "PUT":
         serializer = RatingWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
         Rating.objects.update_or_create(
             user=request.user,
             game=game,
             defaults={
                 "score": serializer.validated_data["score"],
-                "status": "published",
             },
         )
+
     elif game is not None:
         Rating.objects.filter(user=request.user, game=game).delete()
 
@@ -269,6 +269,7 @@ def game_like(request, app_id):
         GameLike.objects.filter(user=request.user, game=game).delete()
 
     return Response(_like_stats(game, request.user))
+
 
 # ---------------------------------------------------------------------------
 # GameShelf reviews
@@ -467,7 +468,6 @@ def _prepare_attachments(files):
 
 
 def _store_attachment(comment, item):
-    # Uploaded files only: the URL always points at our own storage.
     path = default_storage.save(
         f"comment_attachments/{uuid.uuid4().hex}.{item['extension']}", item["file"]
     )
@@ -486,7 +486,7 @@ def _store_attachment(comment, item):
 def review_comments(request, review_id):
     """
     GET  /reviews/<id>/comments/  -> flat list (oldest first); replies carry
-                                     `parent_comment`
+                                    `parent_comment`
     POST /reviews/<id>/comments/  multipart: content, parent_comment?, attachments[]
     """
     review = _get_review_or_404(review_id)
@@ -499,7 +499,6 @@ def review_comments(request, review_id):
                 Q(parent_comment__isnull=True)
                 | Q(
                     parent_comment__deleted_at__isnull=True,
-                    parent_comment__status=ReviewComment.Status.PUBLISHED,
                 )
             )
             .order_by("created_at", "id")
@@ -522,12 +521,11 @@ def review_comments(request, review_id):
     if parent_id:
         parent = _live(
             ReviewComment.objects.filter(
-                pk=parent_id, review=review, status=ReviewComment.Status.PUBLISHED
+                pk=parent_id, review=review
             )
         ).first()
         if parent is None:
             raise ValidationError({"parent_comment": ["That comment no longer exists."]})
-        # Keep threads one level deep: replying to a reply replies to its parent.
         if parent.parent_comment_id:
             parent = parent.parent_comment
 
