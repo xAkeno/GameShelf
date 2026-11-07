@@ -123,9 +123,11 @@ def _reviews_qs(request):
             liked_by_me=_flag(ReviewLike, request, "review"),
             author_score=Subquery(
                 Rating.objects.filter(
-                    user=OuterRef("user"), game=OuterRef("game")
+                    user=OuterRef("user"),
+                    game=OuterRef("game"),
+                    status="published",
                 ).values("score")[:1]
-            ),
+        ),
         )
     )
 
@@ -169,13 +171,22 @@ def _rating_stats(game, user):
     if game is None:
         return {"my_score": None, "average": None, "count": 0}
 
-    aggregate = Rating.objects.filter(game=game).aggregate(
-        average=Avg("score"), count=Count("id")
+    aggregate = Rating.objects.filter(
+        game=game,
+        status="published",
+    ).aggregate(
+        average=Avg("score"),
+        count=Count("id"),
     )
+
     mine = None
     if user.is_authenticated:
         mine = (
-            Rating.objects.filter(game=game, user=user)
+            Rating.objects.filter(
+                game=game,
+                user=user,
+                status="published",
+            )
             .values_list("score", flat=True)
             .first()
         )
@@ -186,7 +197,6 @@ def _rating_stats(game, user):
         "average": round(float(average), 1) if average is not None else None,
         "count": aggregate["count"],
     }
-
 
 @api_view(["GET", "PUT", "DELETE"])
 @permission_classes([IsAuthenticatedOrReadOnly])
@@ -210,7 +220,10 @@ def game_rating(request, app_id):
         Rating.objects.update_or_create(
             user=request.user,
             game=game,
-            defaults={"score": serializer.validated_data["score"]},
+            defaults={
+                "score": serializer.validated_data["score"],
+                "status": "published",
+            },
         )
     elif game is not None:
         Rating.objects.filter(user=request.user, game=game).delete()
