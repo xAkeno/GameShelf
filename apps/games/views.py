@@ -40,6 +40,7 @@ POOL_CACHE_SECONDS = 60 * 10
 
 # Slugs must match GENRES in Browse.tsx. Values are Steam store tag IDs.
 GENRE_TAGS = {
+    # Main genres
     "action": 19,
     "adventure": 21,
     "casual": 597,
@@ -53,6 +54,39 @@ GENRE_TAGS = {
     "platformer": 1625,
     "roguelike": 1716,
     "horror": 1667,
+
+    # Action and adventure subgenres
+    "action-adventure": 4106,
+    "action rpg": 4231,
+    "shooter": 1774,
+    "point & click": 1698,
+    "beat 'em up": 4821,
+    "fighting": 1743,
+
+    # RPG subgenres
+    "jrpg": 4434,
+    "strategy rpg": 17305,
+    "visual novel": 3799,
+    "party-based rpg": 122,
+    "mmorpg": 128,
+
+    # Strategy subgenres
+    "turn-based strategy": 1741,
+    "rts": 1676,
+    "tower defense": 1645,
+    "city builder": 4328,
+
+    # Other genres
+    "arcade": 1773,
+    "sandbox": 1759,
+    "survival": 1662,
+    "roguelite": 3959,
+
+    # Adult-oriented tags
+    "hentai": 9130,
+    "sexual content": 12095,
+    "nudity": 6650,
+    "adult content": 65443,
 }
 
 TOP_RATED_MIN_VOTES = 5   # "m" in the Bayesian formula
